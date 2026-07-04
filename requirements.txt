@@ -1,0 +1,19 @@
+# Runtime dependencies for the Ascend 310B board.
+#
+# The board currently has PyAV 10.0.0 installed in the user site-packages.
+# Do not install latest aiortc directly: aiortc 1.13 pulls av>=14,<15 and
+# pip may try to build PyAV from source on aarch64.
+
+numpy
+opencv-python
+
+# Offline TFLite/PC-side baseline. On the board this is optional unless you run
+# TFLite validation scripts.
+ai-edge-litert
+
+# WebRTC runtime.
+aiohttp>=3.8,<4
+av==10.0.0
+aiortc==1.5.0
+aioice>=0.9,<1
+pylibsrtp>=0.8,<1
