@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Evaluate Ascend OM hand models on the portable HaGRIDv2 MediaPipe dataset."""
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ MODEL_SETS = {
         "required": True,
     },
     "lite": {
-        "om_detector": "models/om/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices_origin_dtype_ascend310b4_singlethread.om",
+        "om_detector": "models/om/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices_origin_dtype.om",
         "om_landmark": "models/om/mediapipe_legacy_0_10_14_hand_landmark_lite.om",
         "onnx_detector": "models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices.onnx",
         "onnx_landmark": "models/onnx/mediapipe_legacy_0_10_14_hand_landmark_lite.onnx",

@@ -39,11 +39,11 @@ Raw tensor-level comparison:
 ```bash
 python scripts/compare_onnx_om_raw.py \
   --onnx models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite.onnx \
-  --om models/om/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices_origin_dtype_ascend310b4_singlethread.om \
+  --om models/om/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices_origin_dtype.om \
   --shape 1,192,192,3 \
   --samples 100 \
   --warmup 2 \
-  --output-dir runs/onnx_om_raw_compare/lite_palm_fullstyle_ascend310b4_singlethread_persistent_100samples
+  --output-dir runs/onnx_om_raw_compare/lite_palm_fullstyle_origin_dtype_persistent_100samples
 ```
 
 Use `--reload-om-each-sample` only when checking a suspect palm detector OM for model-handle reuse drift.
@@ -103,7 +103,7 @@ Benchmark a specific OM:
 
 ```bash
 python scripts/benchmark_om_inference.py \
-  --model models/om/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices_origin_dtype_ascend310b4_singlethread.om \
+  --model models/om/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices_origin_dtype.om \
   --warmup 20 \
   --iterations 200
 ```
@@ -156,9 +156,9 @@ Build the 8T optimized lite palm OM. `run_clean_atc.py` does not pass graph-para
 ```bash
 python scripts/run_clean_atc.py \
   --model models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices.onnx \
-  --output models/om/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices_origin_dtype_ascend310b4_singlethread \
-  --log runs/atc_8t/logs/lite_palm_fullstyle_origin_dtype_ascend310b4_singlethread.log \
-  --report runs/atc_8t/lite_palm_fullstyle_origin_dtype_ascend310b4_singlethread.json \
+  --output models/om/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices_origin_dtype \
+  --log runs/atc_8t/logs/lite_palm_fullstyle_origin_dtype.log \
+  --report runs/atc_8t/lite_palm_fullstyle_origin_dtype.json \
   --soc-version Ascend310B4 \
   --precision-mode must_keep_origin_dtype \
   --env-mode python_runtime \
@@ -173,11 +173,8 @@ Compile the deployed full model set for the runtime SoC:
 python scripts/build_20t_om_models.py --soc-version auto --model-set deployed_full
 ```
 
-The historical lite direct OM experiment is still available for reproducibility:
-
-```bash
-python scripts/build_20t_om_models.py --soc-version auto --model-set legacy_lite
-```
+If a board-specific rebuild produces raw outputs identical to the existing OM,
+do not keep a hardware-suffixed duplicate model in `models/om/`.
 
 ## CANN VENC Status
 

@@ -1,4 +1,4 @@
-# MediaPipe Hand Ascend 310B
+﻿# MediaPipe Hand Ascend 310B
 
 This repository is the Ascend 310B deployment package for the MediaPipe Hand
 two-stage pipeline.
@@ -33,8 +33,8 @@ models/onnx/mediapipe_legacy_0_10_14_palm_detection_full.onnx
   -> models/om/mediapipe_legacy_0_10_14_palm_detection_full_downsample_resize_maxpool_slices_origin_dtype.om
 ```
 
-The original `mediapipe_legacy_0_10_14_palm_detection_full.om` is kept only as
-a conversion reference and is not the recommended deployment model.
+Direct palm OM files that do not pass raw-output and end-to-end validation are
+not kept in `models/om/`.
 
 ## Board Environment
 
