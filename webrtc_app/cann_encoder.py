@@ -466,6 +466,8 @@ class CannVenc:
         self._align = 16
         self._stride = ((width + self._align - 1) // self._align) * self._align
         self._nv12_size = self._stride * height * 3 // 2
+        # Python ACL VENC binding requires a caller-created output stream desc.
+        self._out_buf_size = width * height * 3 // 2
 
         try:
             self._create_channel()
@@ -619,10 +621,25 @@ class CannVenc:
         _acl_media.dvpp_set_pic_desc_width_stride(pic_desc, self._stride)
         _acl_media.dvpp_set_pic_desc_height_stride(pic_desc, height_stride)
 
+        out_buffer, ret = _acl_media.dvpp_malloc(self._out_buf_size)
+        if ret != ACL_SUCCESS or out_buffer is None:
+            _acl_media.dvpp_free(input_buffer)
+            _acl_media.dvpp_destroy_pic_desc(pic_desc)
+            raise RuntimeError(f"dvpp_malloc output failed: {ret}")
+
+        stream_desc = _acl_media.dvpp_create_stream_desc()
+        if stream_desc is None:
+            _acl_media.dvpp_free(input_buffer)
+            _acl_media.dvpp_free(out_buffer)
+            _acl_media.dvpp_destroy_pic_desc(pic_desc)
+            raise RuntimeError("dvpp_create_stream_desc failed")
+        _acl_media.dvpp_set_stream_desc_data(stream_desc, out_buffer)
+        _acl_media.dvpp_set_stream_desc_size(stream_desc, self._out_buf_size)
+
         if force_keyframe:
             _acl_media.venc_set_frame_config_force_i_frame(self._frame_config, True)
 
-        # Drain callback queue before sending — leftover data indicates a
+        # Drain callback queue before sending; leftover data indicates a
         # previous consume failure; log it so silent frame loss is visible.
         drained = 0
         while not self._cb_queue.empty():
@@ -634,13 +651,13 @@ class CannVenc:
         if drained:
             logger.warning("VENC callback queue drained %d leftover frame(s)", drained)
 
-        # CANN 8.0's aclvencSendFrame third argument is a reserved parameter.
-        # The encoded output stream descriptor is provided by the callback.
         ret = _acl_media.venc_send_frame(self._channel_desc, pic_desc,
-                                          None, self._frame_config, None)
+                                          stream_desc, self._frame_config, None)
         if ret != ACL_SUCCESS:
             _acl_media.dvpp_free(input_buffer)
+            _acl_media.dvpp_free(out_buffer)
             _acl_media.dvpp_destroy_pic_desc(pic_desc)
+            _acl_media.dvpp_destroy_stream_desc(stream_desc)
             raise RuntimeError(f"venc_send_frame failed: {ret}")
 
         try:
@@ -654,6 +671,8 @@ class CannVenc:
 
         # Cleanup
         _acl_media.dvpp_free(input_buffer)
+        _acl_media.dvpp_free(out_buffer)
+        _acl_media.dvpp_destroy_stream_desc(stream_desc)
         # pic_desc is destroyed in callback
 
         if force_keyframe:

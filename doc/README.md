@@ -1,6 +1,8 @@
-﻿# MediaPipe Hand Ascend 310B 文档
+# MediaPipe Hand Ascend 310B 文档
 
 这组文档面向 `mediapipe_hand_ascend310b` 独立子工程，解释 MediaPipe Hand 的算法、数据结构、模型特点、PC 侧 TFLite baseline、ONNX 转换误差、Ascend 310B OM 误差和移植路线。
+
+注意：本目录保留的是迁移和误差分析历史记录，其中部分 PC 侧 baseline、TFLite 评估和临时探针脚本已不再放入正式 310B 部署包。当前可运行入口以仓库根目录 `README.md` 和 `scripts/README.md` 为准。
 
 当前 baseline 已同时纳入两类人工校正数据：
 
@@ -17,6 +19,14 @@
 6. [ONNX 模型误差分析](06_onnx_error_analysis.md)：ONNX opset、raw-output 对齐、ONNX 端到端 test 集验证。
 7. [OM 模型误差分析](07_om_error_analysis.md)：OM raw-output 对齐、OM 端到端误差、板端运行时现象和后续优化方向。
 8. [WebRTC 实时运行方案](08_webrtc_runtime.md)：从 case8 移植的 WebRTC/H.264/DVPP 方案，以及手部 OM 两阶段实时入口。
+9. [20T 开发板 OM 重编译与推理时间记录](09_20t_om_benchmark.md)：在 Orange Pi AI Pro 20T 上重编译 `Ascend310B1` OM、对比旧 OM 和 20T OM 的推理时间与输出一致性。
+10. [Lite 模型 20T OM 转换、误差与速度验证](10_lite_om_20t_validation.md)：lite palm/landmark 在 20T 上的 ATC 转换、ONNX vs OM raw-output、视频端到端对比和速度测试。
+11. [Palm Full/Lite ONNX 算子结构差异](11_palm_full_lite_operator_diff.md)：对比 legacy palm full/lite 的 op_type、Conv block、Resize/Pad/MaxPool 敏感结构和检测头。
+12. [Lite Palm 问题定位与优化 ONNX](12_lite_palm_issue_localization.md)：定位 direct lite palm OM 的复用漂移和 fresh-load 精度问题，并记录可用于 ATC 的 full-style lite palm 优化 ONNX。
+13. [Lite Palm Split ONNX 与 ATC 后续定位](13_lite_palm_split_atc_followup.md)：记录 identity-bridge split ONNX、split ATC 失败结果，以及当前板端 ATC/TBE 环境复测结论。
+14. [8T 开发板 Full OM 推理时间记录](14_8t_full_om_benchmark.md)：在 `ascend8t` 上按 20T 相同流程测试 full palm/landmark OM 的推理时间。
+15. [Lite Palm 8T OM 优化、误差与速度](15_lite_palm_8t_om_optimization.md)：在 `ascend8t` 上无 graph parallel 编译 optimized lite palm OM，并记录 ONNX vs OM raw-output 误差和推理速度。
+16. [20T Portable HaGRIDv2 OM 数据集精度与速度验证](16_20t_hf_dataset_om_validation.md)：在 `ascend20t` 上用 `1663` 张真实图片全量评估 full/lite OM 的精度和真实链路速度。
 
 ## 最新核心结论
 
@@ -33,6 +43,16 @@
 | ONNX 端到端 `legacy_full` | `palm_datasets/test` | vs 同组 TFLite mean `0.0048 px`，p95 `0.0149 px` |
 | 310B 优化 OM `legacy_full_palm` | `palm_datasets/test` 前 200 张 reference | AP50 与 TFLite 相同 `0.984348`，mAP `0.604666` vs TFLite `0.604634` |
 | 310B 优化 OM raw output | `downsample_resize_maxpool_slices_origin_dtype.om` | raw box mean_abs `0.007474`，raw score mean_abs `0.002589` |
+| 20T 重编译 OM | `Ascend310B1` ATC + 20 组随机输入 | 与旧 OM 原始输出完全一致，`max_abs=0` |
+| 20T OM 推理时间 | `warmup=20, iterations=200` | palm execute mean `11.532 ms`，landmark execute mean `1.891 ms`，未比旧 OM 更快 |
+| 8T full OM 推理时间 | `ascend8t`, `warmup=20, iterations=200` | palm execute mean `26.931 ms`，landmark execute mean `3.889 ms` |
+| 20T lite OM | `legacy_lite` ONNX vs OM | lite palm direct OM raw-output 误差极大，视频端到端不一致；lite landmark OM 可单独运行 |
+| palm full/lite 算子差异 | ONNX graph-level compare | lite 没有新增 full 不存在的 op_type，主要是每个尺度少一个 residual bottleneck，总计少 `10 Conv + 5 Add + 5 PRelu` |
+| lite palm 优化 ONNX | 原始 lite ONNX vs full-style optimized lite ONNX | boxes max_abs `5.340576e-05`，scores max_abs `8.583069e-06`；ONNX 语义等价，并已在 8T 上生成可执行优化 OM |
+| lite palm split ONNX | 原始 lite ONNX vs identity-bridge stage1+stage2 | 本地 20 组随机输入输出误差全为 `0`；但 20T ATC 编译 stage1/stage2 均 returncode `139`，未生成 split OM |
+| 8T optimized lite palm OM | `ascend8t` CANN 8.3, no graph parallel, `must_keep_origin_dtype` | 100 组随机输入：boxes mean_rel `0.829947%`，scores mean_rel `0.014741%`，boxes p95_rel `1.046142%`；execute mean `24.799 ms` |
+| 20T full OM 数据集验证 | Portable HaGRIDv2 MediaPipe test `1663` 张 | full passed；precision `0.996399`，recall `0.997596`，AP50 `0.994933`，full21 mean `0.127865 px`，total mean `21.353 ms` |
+| 20T lite OM 数据集验证 | Portable HaGRIDv2 MediaPipe test `1663` 张 | lite report-only；precision `0.978877`，recall `0.974760`，AP50 `0.983212`，full21 mean `1.318512 px`，total mean `19.900 ms` |
 
 结论很清楚：
 
@@ -41,6 +61,15 @@
 - TFLite 转 ONNX 的 raw-output 和端到端误差都很小，ONNX 可以作为 ATC 转 OM 的输入基线。
 - 原始 310B OM 的 palm detector raw output 偏差很大；通过改写 `Pad+Add` 下采样残差、`Resize(linear, half_pixel)` 和 `MaxPool`，当前优化 OM 已将 AP50 拉回到与 TFLite 一致，mAP 差异约 `0.000032`。
 - 当前 raw box/keypoint 平均相对误差为 `0.062652%`，raw score 平均相对误差为 `0.025567%`，均低于 `0.1%`。
+- 在 Orange Pi AI Pro 20T 上用 `Ascend310B1` 重新 ATC 编译的 OM 与旧正式 OM 原始输出完全一致，推理速度基本持平；当前不需要按 8T/20T 硬件版本维护多套 OM。
+- `legacy_lite` 的 direct palm OM 虽可生成并执行，但 ONNX vs OM raw-output 和 `video/test.mp4` 端到端结果均不一致，不能用于正式部署。
+- `legacy_lite` direct palm OM 复用模型句柄会出现 `655xx` 级 raw-output 漂移；每次 fresh-load 可消除该漂移，但 raw-output 仍不足以通过视频端到端一致性验证。
+- `legacy_lite` palm 与 full 使用同一套敏感结构：`Resize`、tail channel `Pad+Add`、`MaxPool` 的数量和 shape 一致；lite 主要是 backbone 更浅。
+- 已创建 `mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices.onnx`，它与原始 lite ONNX 等价，可作为后续 ATC/TBE 问题定位输入。
+- 已创建 identity-bridge split lite palm ONNX，stage1/stage2 在本地严格等价；20T 板端 ATC/TBE 未能生成 split OM。
+- 在 `ascend8t` 上，full-style optimized lite palm ONNX 已成功生成 `must_keep_origin_dtype` OM；raw-output 平均相对误差低于 `1%`，但 boxes p95_rel `1.046142%`，速度接近 full palm，收益有限。
+- 当前板端复测中，原始 lite palm ONNX 使用旧 `build_20t_om_models.py` 重新 ATC 也返回 `139`，说明阻塞不只来自新 split/optimized ONNX。
+- 在 `ascend20t` 上，full OM 使用 Portable HaGRIDv2 MediaPipe test 全量 `1663` 张图片通过正式验收；真实两阶段链路平均 `21.353 ms/image`。lite OM 可运行，平均 `19.900 ms/image`，但精度明显低于 full，默认仍作为 report-only。
 - 迁移时必须同时复刻模型推理和几何后处理：MediaPipe 风格的 detector `warpPerspective` 输入采样、SSD anchor、decode、weighted NMS、hand rect、旋转 ROI、landmark 反投影。
 
 ## 复现实验命令

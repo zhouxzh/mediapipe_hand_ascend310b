@@ -1,0 +1,80 @@
+{
+  "task": "rewrite_palm_maxpool_slices",
+  "source_model": "/home/HwHiAiUser/Documents/mediapipe_hand_ascend310b/models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize.onnx",
+  "output_model": "/home/HwHiAiUser/Documents/mediapipe_hand_ascend310b/models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices.onnx",
+  "rewrites": [
+    {
+      "node_index": 15,
+      "node_name": "model_1/model/max_pooling2d/MaxPool",
+      "input_name": "model_1/model/p_re_lu_3/add;model_1/model/p_re_lu_3/Relu;model_1/model/p_re_lu_3/Neg_1;model_1/model/p_re_lu_3/Relu_1;model_1/model/p_re_lu_3/mul1",
+      "output_name": "model_1/model/max_pooling2d/MaxPool",
+      "input_shape": [
+        1,
+        32,
+        96,
+        96
+      ],
+      "output_shape": [
+        1,
+        32,
+        48,
+        48
+      ]
+    },
+    {
+      "node_index": 35,
+      "node_name": "model_1/model/max_pooling2d_1/MaxPool",
+      "input_name": "model_1/model/p_re_lu_7/add;model_1/model/p_re_lu_7/Relu;model_1/model/p_re_lu_7/Neg_1;model_1/model/p_re_lu_7/Relu_1;model_1/model/p_re_lu_7/mul1",
+      "output_name": "model_1/model/max_pooling2d_1/MaxPool",
+      "input_shape": [
+        1,
+        64,
+        48,
+        48
+      ],
+      "output_shape": [
+        1,
+        64,
+        24,
+        24
+      ]
+    },
+    {
+      "node_index": 55,
+      "node_name": "model_1/model/max_pooling2d_2/MaxPool",
+      "input_name": "model_1/model/p_re_lu_11/add;model_1/model/p_re_lu_11/Relu;model_1/model/p_re_lu_11/Neg_1;model_1/model/p_re_lu_11/Relu_1;model_1/model/p_re_lu_11/mul1",
+      "output_name": "model_1/model/max_pooling2d_2/MaxPool",
+      "input_shape": [
+        1,
+        128,
+        24,
+        24
+      ],
+      "output_shape": [
+        1,
+        128,
+        12,
+        12
+      ]
+    },
+    {
+      "node_index": 75,
+      "node_name": "model_1/model/max_pooling2d_3/MaxPool",
+      "input_name": "model_1/model/p_re_lu_15/add;model_1/model/p_re_lu_15/Relu;model_1/model/p_re_lu_15/Neg_1;model_1/model/p_re_lu_15/Relu_1;model_1/model/p_re_lu_15/mul1",
+      "output_name": "model_1/model/max_pooling2d_3/MaxPool",
+      "input_shape": [
+        1,
+        256,
+        12,
+        12
+      ],
+      "output_shape": [
+        1,
+        256,
+        6,
+        6
+      ]
+    }
+  ],
+  "rewritten_nodes": 4
+}

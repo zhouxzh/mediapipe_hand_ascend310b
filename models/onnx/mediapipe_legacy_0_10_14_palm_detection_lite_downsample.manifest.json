@@ -1,0 +1,77 @@
+{
+  "task": "rewrite_palm_downsample_residual",
+  "source_model": "/home/HwHiAiUser/Documents/mediapipe_hand_ascend310b/models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite.onnx",
+  "output_model": "/home/HwHiAiUser/Documents/mediapipe_hand_ascend310b/models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite_downsample.onnx",
+  "rewrites": [
+    {
+      "pad_node_index": 16,
+      "add_node_index": 19,
+      "pad_output": "model_1/model/channel_padding/Pad",
+      "pad_input": "model_1/model/max_pooling2d/MaxPool",
+      "add_output": [
+        "model_1/model/add_3/add"
+      ],
+      "branch_input": "model_1/model/batch_normalization_4/FusedBatchNormV3;model_1/model/depthwise_conv2d_7/depthwise;model_1/model/conv2d_4/Conv2D1",
+      "channels": 32,
+      "input_shape": [
+        1,
+        32,
+        48,
+        48
+      ],
+      "output_shape": [
+        1,
+        64,
+        48,
+        48
+      ]
+    },
+    {
+      "pad_node_index": 34,
+      "add_node_index": 37,
+      "pad_output": "model_1/model/channel_padding_1/Pad",
+      "pad_input": "model_1/model/max_pooling2d_1/MaxPool",
+      "add_output": [
+        "model_1/model/add_7/add"
+      ],
+      "branch_input": "model_1/model/batch_normalization_8/FusedBatchNormV3;model_1/model/conv2d_25/Conv2D;model_1/model/conv2d_8/Conv2D1",
+      "channels": 64,
+      "input_shape": [
+        1,
+        64,
+        24,
+        24
+      ],
+      "output_shape": [
+        1,
+        128,
+        24,
+        24
+      ]
+    },
+    {
+      "pad_node_index": 52,
+      "add_node_index": 55,
+      "pad_output": "model_1/model/channel_padding_2/Pad",
+      "pad_input": "model_1/model/max_pooling2d_2/MaxPool",
+      "add_output": [
+        "model_1/model/add_11/add"
+      ],
+      "branch_input": "model_1/model/batch_normalization_12/FusedBatchNormV3;model_1/model/conv2d_22/Conv2D;model_1/model/conv2d_12/Conv2D1",
+      "channels": 128,
+      "input_shape": [
+        1,
+        128,
+        12,
+        12
+      ],
+      "output_shape": [
+        1,
+        256,
+        12,
+        12
+      ]
+    }
+  ],
+  "rewritten_blocks": 3
+}

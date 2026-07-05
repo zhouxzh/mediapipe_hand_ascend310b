@@ -1,71 +1,19 @@
 ﻿# Scripts
 
-`scripts/` 只放可直接运行的 Python 程序，不放 PowerShell 或 shell wrapper。这样后续复制到 Ascend 310B Linux 环境时不需要额外适配入口脚本。
+`scripts/` contains Python entry points needed on the Ascend 310B deployment board or needed to reproduce the deployed OM models.
 
-统一 baseline：
-
-```bash
-conda activate mediapipe_legacy
-python scripts/run_baseline.py --split test --run-matrix
-```
-
-当前环境已经满足依赖时：
+Before running board-side scripts:
 
 ```bash
-python scripts/run_baseline.py
-```
-
-常用参数：
-
-```bash
-python scripts/run_baseline.py --split valid --run-matrix --output-root runs/baseline_valid
-python scripts/run_baseline.py --max-images 300
-python scripts/run_baseline.py --save-vis 8
-python scripts/run_baseline.py --run-matrix
-python scripts/run_baseline.py --data /path/to/palm_datasets --handlm-data /path/to/handlm_datasets --current-reference /path/to/mediapipe_predictions.json
-```
-
-单项脚本也可以直接运行，例如：
-
-```bash
-python scripts/inspect_tflite.py --model-dir models/tflite --output runs/baseline/model_info.json
-python scripts/eval_palm_tflite.py --data ../data/palm_datasets --official-mediapipe references/current_tasks/mediapipe_predictions.json
-python scripts/eval_handlm_tflite.py --data ../data/handlm_datasets --output-dir runs/baseline/handlm_manual_gt
-python scripts/summarize_baseline.py --output-root runs/baseline
-```
-
-模型移植入口：
-
-```bash
-# PC / mediapipe_legacy 环境
-python scripts/export_onnx.py --group legacy_full
-
-# Ascend 310B，先 source CANN 环境；脚本内部会固定单线程 ATC
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-python scripts/export_ascend_om.py --group legacy_full
-```
-
-palm detector OM 专项分析：
-
-```bash
-# PC / mediapipe_legacy 环境：生成真实图片输入的 TFLite reference
-python scripts/analyze_palm_om.py make-reference --split test --max-images 200 --output-dir runs/palm_om/legacy_full_palm
-
-# 同步 reference 到 310B 后，在板端 base 环境运行
+cd ~/Documents/mediapipe_hand_ascend310b
 source /usr/local/miniconda3/etc/profile.d/conda.sh
 conda activate base
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
-python scripts/analyze_palm_om.py compare-om --reference-dir runs/palm_om/legacy_full_palm --output-dir runs/palm_om/legacy_full_palm/om_compare
 ```
 
-WebRTC 实时手部关键点入口：
+## Realtime WebRTC App
 
 ```bash
-source /usr/local/miniconda3/etc/profile.d/conda.sh
-conda activate base
-python -m pip install --user -r requirements.txt
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-
 python scripts/webrtc_hand_om_app.py \
   --source /dev/video0 \
   --camera-width 1280 \
@@ -73,22 +21,181 @@ python scripts/webrtc_hand_om_app.py \
   --camera-fps 30 \
   --camera-backend opencv \
   --camera-fourcc MJPG \
+  --encoder-mode cpu \
   --port 8080
 ```
 
-浏览器打开脚本打印的 `http://<310B-ip>:8080`。详细说明见 `doc/08_webrtc_runtime.md`。
+The default model pair is:
 
-VENC 诊断入口：
-
-```bash
-# 只读状态检查，不创建 VENC channel
-python scripts/check_venc_runtime.py
-
-# ACLLite 风格 C++ 最小探针，默认只编译到 build/，不创建 VENC channel
-python scripts/probe_venc_acllite_cpp.py
+```text
+models/om/mediapipe_legacy_0_10_14_palm_detection_full_downsample_resize_maxpool_slices_origin_dtype.om
+models/om/mediapipe_legacy_0_10_14_hand_landmark_full.om
 ```
 
-真实创建 VENC channel 的 `--probe` / `--run` 都需要显式风险确认参数，避免在 CANN 8.0 失败路径上反复触发驱动侧内存压力。
+## ONNX/OM Validation
 
-`hand_pipeline/` 是库代码；这些脚本在启动时会自动把项目根目录加入 `sys.path`，因此不需要安装本工程。
+Raw tensor-level comparison:
 
+```bash
+python scripts/compare_onnx_om_raw.py \
+  --onnx models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite.onnx \
+  --om models/om/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices_origin_dtype_ascend310b4_singlethread.om \
+  --shape 1,192,192,3 \
+  --samples 100 \
+  --warmup 2 \
+  --output-dir runs/onnx_om_raw_compare/lite_palm_fullstyle_ascend310b4_singlethread_persistent_100samples
+```
+
+Use `--reload-om-each-sample` only when checking a suspect palm detector OM for model-handle reuse drift.
+
+Video-level ONNX/OM comparison:
+
+```bash
+python scripts/run_video_onnx_om_checks.py --video video/test.mp4
+```
+
+Quick smoke test:
+
+```bash
+python scripts/run_video_onnx_om_checks.py --video video/test.mp4 --max-frames 5 --save-vis 2
+```
+
+For a fully explicit pair:
+
+```bash
+python scripts/compare_video_onnx_om.py \
+  --video video/test.mp4 \
+  --onnx-detector models/onnx/mediapipe_legacy_0_10_14_palm_detection_full.onnx \
+  --onnx-landmark models/onnx/mediapipe_legacy_0_10_14_hand_landmark_full.onnx \
+  --om-detector models/om/mediapipe_legacy_0_10_14_palm_detection_full_downsample_resize_maxpool_slices_origin_dtype.om \
+  --om-landmark models/om/mediapipe_legacy_0_10_14_hand_landmark_full.om \
+  --output-dir runs/video_onnx_om_compare/original_onnx_vs_optimized_om \
+  --reload-detector-each-frame
+```
+
+Dataset-level OM evaluation on the portable HaGRIDv2 MediaPipe test split:
+
+```bash
+python scripts/eval_hf_hand_dataset_om.py \
+  --model-set full \
+  --max-images 20 \
+  --save-vis 2
+```
+
+Full `1663` image validation for the deployed full OM and accepted lite OM:
+
+```bash
+python scripts/eval_hf_hand_dataset_om.py --model-set full,lite
+```
+
+Use `--run-onnx` to also compute ONNX reference metrics and OM-vs-ONNX
+differences. Reports are written under `runs/hf_hand_dataset_om/`.
+
+## OM Inference Latency
+
+```bash
+python scripts/benchmark_om_inference.py \
+  --warmup 20 \
+  --iterations 200
+```
+
+Benchmark a specific OM:
+
+```bash
+python scripts/benchmark_om_inference.py \
+  --model models/om/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices_origin_dtype_ascend310b4_singlethread.om \
+  --warmup 20 \
+  --iterations 200
+```
+
+## Rebuild Optimized Palm ONNX/OM
+
+Regenerate the optimized full palm ONNX from the original full ONNX:
+
+```bash
+python scripts/build_optimized_palm_om.py \
+  --input-onnx models/onnx/mediapipe_legacy_0_10_14_palm_detection_full.onnx \
+  --optimized-onnx models/onnx/mediapipe_legacy_0_10_14_palm_detection_full_downsample_resize_maxpool_slices.onnx
+```
+
+Rebuild the production full palm OM on the board:
+
+```bash
+python scripts/build_optimized_palm_om.py \
+  --skip-rewrite \
+  --compile-om \
+  --optimized-onnx models/onnx/mediapipe_legacy_0_10_14_palm_detection_full_downsample_resize_maxpool_slices.onnx \
+  --om-output models/om/mediapipe_legacy_0_10_14_palm_detection_full_downsample_resize_maxpool_slices_origin_dtype \
+  --atc-log runs/palm_om/atc_logs/downsample_resize_maxpool_slices_origin_dtype.log \
+  --precision-mode must_keep_origin_dtype
+```
+
+Generate the optimized lite palm ONNX:
+
+```bash
+python scripts/build_optimized_palm_om.py \
+  --input-onnx models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite.onnx \
+  --downsample-onnx models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite_downsample.onnx \
+  --resize-onnx models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize.onnx \
+  --optimized-onnx models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices.onnx
+```
+
+Verify the optimized lite ONNX still matches the original lite ONNX:
+
+```bash
+python scripts/compare_onnx_raw.py \
+  --left models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite.onnx \
+  --right models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices.onnx \
+  --shape 1,192,192,3 \
+  --samples 10 \
+  --output-dir runs/onnx_raw_compare/lite_palm_original_vs_full_style_optimized
+```
+
+Build the 8T optimized lite palm OM. `run_clean_atc.py` does not pass graph-parallel ATC flags by default:
+
+```bash
+python scripts/run_clean_atc.py \
+  --model models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices.onnx \
+  --output models/om/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices_origin_dtype_ascend310b4_singlethread \
+  --log runs/atc_8t/logs/lite_palm_fullstyle_origin_dtype_ascend310b4_singlethread.log \
+  --report runs/atc_8t/lite_palm_fullstyle_origin_dtype_ascend310b4_singlethread.json \
+  --soc-version Ascend310B4 \
+  --precision-mode must_keep_origin_dtype \
+  --env-mode python_runtime \
+  --cache-mode force
+```
+
+## 20T/8T Benchmark Rebuilds
+
+Compile the deployed full model set for the runtime SoC:
+
+```bash
+python scripts/build_20t_om_models.py --soc-version auto --model-set deployed_full
+```
+
+The historical lite direct OM experiment is still available for reproducibility:
+
+```bash
+python scripts/build_20t_om_models.py --soc-version auto --model-set legacy_lite
+```
+
+## CANN VENC Status
+
+Read-only status check:
+
+```bash
+python scripts/check_venc_runtime.py
+```
+
+Creating a VENC channel is guarded because failed CANN 8.0 VENC attempts can leave driver-side memory pressure:
+
+```bash
+python scripts/check_venc_runtime.py \
+  --join-usermemory \
+  --probe \
+  --i-understand-venc-probe-risk \
+  --width 640 \
+  --height 480 \
+  --fps 30 \
+  --bitrate-kbps 4000
+```

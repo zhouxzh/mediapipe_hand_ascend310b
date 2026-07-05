@@ -1,10 +1,11 @@
 [project]
 name = "mediapipe-hand-ascend310b"
 version = "0.1.0"
-description = "MediaPipe hand model extraction, evaluation, conversion, and Ascend 310B deployment helpers."
+description = "MediaPipe hand Ascend 310B deployment and model reproduction helpers."
 requires-python = ">=3.9"
 dependencies = [
   "numpy",
   "opencv-python",
-  "ai-edge-litert",
+  "onnxruntime==1.19.2",
+  "onnx==1.19.1",
 ]

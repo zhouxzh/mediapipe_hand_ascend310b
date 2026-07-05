@@ -1,4 +1,4 @@
-__pycache__/
+﻿__pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
@@ -13,6 +13,14 @@ references/current_tasks/*
 
 models/onnx/*
 !models/onnx/README.md
+!models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite_downsample.onnx
+!models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite_downsample.manifest.json
+!models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize.onnx
+!models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize.manifest.json
+!models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices.onnx
+!models/onnx/mediapipe_legacy_0_10_14_palm_detection_lite_downsample_resize_maxpool_slices.manifest.json
 models/om/*
 !models/om/README.md
 models/tflite/*
+video/*
+

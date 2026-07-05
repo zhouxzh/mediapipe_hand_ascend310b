@@ -52,8 +52,6 @@ def build_command(args: argparse.Namespace, model_path: Path, output_stem: Path,
         f"--input_format={input_format}",
         f"--input_shape={input_shape}",
         f"--soc_version={args.soc_version}",
-        "--enable_graph_parallel=0",
-        "--ac_parallel_enable=0",
         "--op_compiler_cache_mode=enable",
     ]
     if args.precision_mode:

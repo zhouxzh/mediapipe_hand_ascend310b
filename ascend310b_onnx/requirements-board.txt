@@ -1,0 +1,4 @@
+numpy
+opencv-python-headless
+# Install ais_bench and aclruntime from the CANN/AIT wheels that match
+# the board Python version and CPU architecture.

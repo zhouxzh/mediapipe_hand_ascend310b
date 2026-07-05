@@ -1,19 +1,31 @@
 # Runtime dependencies for the Ascend 310B board.
 #
-# The board currently has PyAV 10.0.0 installed in the user site-packages.
-# Do not install latest aiortc directly: aiortc 1.13 pulls av>=14,<15 and
-# pip may try to build PyAV from source on aarch64.
+# PyAV 10.0.0 does not provide a cp39/aarch64 wheel on the board's index, so
+# pip falls back to a source build and fails unless FFmpeg development headers
+# are installed. The WebRTC pins below were checked with --only-binary on the
+# Ascend 310B base environment.
 
-numpy
-opencv-python
+# Core runtime versions verified on Ascend 310B base.
+numpy==1.23.0
+opencv-python==4.9.0.80
 
-# Offline TFLite/PC-side baseline. On the board this is optional unless you run
-# TFLite validation scripts.
-ai-edge-litert
+# ONNX validation on Ascend 310B base environment.
+# The board uses Python 3.9/aarch64; these versions have matching wheels.
+onnxruntime==1.19.2
+onnx==1.19.1
+
+# Hugging Face dataset download and Parquet reading.
+# Verified on Ascend 310B base: Python 3.9.2/aarch64.
+# Keep this below 1.0 because the board base environment can include
+# tokenizers==0.19.1, which requires huggingface-hub<1.0,>=0.16.4.
+huggingface_hub==0.36.2
+datasets==4.5.0
+pyarrow==21.0.0
+pillow==10.2.0
 
 # WebRTC runtime.
-aiohttp>=3.8,<4
-av==10.0.0
-aiortc==1.5.0
-aioice>=0.9,<1
-pylibsrtp>=0.8,<1
+aiohttp==3.13.5
+av==14.2.0
+aiortc==1.13.0
+aioice==0.10.2
+pylibsrtp==0.12.0

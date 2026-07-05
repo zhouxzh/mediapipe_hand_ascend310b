@@ -112,8 +112,6 @@ def atc_command(args: argparse.Namespace) -> list[str]:
         "--input_shape=input_1:1,192,192,3",
         f"--soc_version={args.soc_version}",
         f"--precision_mode={args.precision_mode}",
-        "--enable_graph_parallel=0",
-        "--ac_parallel_enable=0",
         "--op_compiler_cache_mode=force",
     ]
     if args.op_select_implmode:

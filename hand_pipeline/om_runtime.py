@@ -98,7 +98,7 @@ class PersistentAclRuntime:
 
 
 class PersistentAclModel:
-    """Static one-input OM runner with persistent input and output buffers."""
+    """Static OM runner with persistent input and output buffers."""
 
     def __init__(self, model_path: str | Path, runtime: PersistentAclRuntime | None = None, device_id: int = 0) -> None:
         self.acl = _load_acl()
@@ -201,21 +201,27 @@ class PersistentAclModel:
             return np.dtype(np.float16)
         raise ValueError(f"Cannot infer output dtype for {output_size} bytes")
 
-    def infer(self, input_array: np.ndarray) -> list[np.ndarray]:
-        if not isinstance(input_array, np.ndarray):
-            raise TypeError("input_array must be numpy.ndarray")
+    def infer(self, input_array: np.ndarray | list[np.ndarray] | tuple[np.ndarray, ...]) -> list[np.ndarray]:
+        if isinstance(input_array, np.ndarray):
+            input_arrays = [input_array]
+        elif isinstance(input_array, (list, tuple)) and all(isinstance(item, np.ndarray) for item in input_array):
+            input_arrays = list(input_array)
+        else:
+            raise TypeError("input_array must be numpy.ndarray or a sequence of numpy.ndarray")
         if not self.input_buffers:
             raise RuntimeError("Model has no input buffers")
+        if len(input_arrays) != len(self.input_buffers):
+            raise ValueError(f"Input count mismatch: got {len(input_arrays)}, model expects {len(self.input_buffers)}")
 
         self.runtime.set_context()
-        first_input = self.input_buffers[0]
-        input_size = int(first_input["size"])
-        input_bytes = self._prepare_input_bytes(input_array, input_size)
-        host_input_ptr = self.acl.util.bytes_to_ptr(input_bytes)
-        _check_ret(
-            self.acl.rt.memcpy(first_input["ptr"], input_size, host_input_ptr, len(input_bytes), ACL_MEMCPY_HOST_TO_DEVICE),
-            "acl.rt.memcpy host_to_device",
-        )
+        for index, (input_buffer, array) in enumerate(zip(self.input_buffers, input_arrays)):
+            input_size = int(input_buffer["size"])
+            input_bytes = self._prepare_input_bytes(array, input_size)
+            host_input_ptr = self.acl.util.bytes_to_ptr(input_bytes)
+            _check_ret(
+                self.acl.rt.memcpy(input_buffer["ptr"], input_size, host_input_ptr, len(input_bytes), ACL_MEMCPY_HOST_TO_DEVICE),
+                f"acl.rt.memcpy host_to_device input[{index}]",
+            )
         _check_ret(self.acl.mdl.execute(self.model_id, self.input_dataset, self.output_dataset), "acl.mdl.execute")
 
         outputs: list[np.ndarray] = []

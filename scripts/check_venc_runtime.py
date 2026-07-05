@@ -2,8 +2,9 @@
 """Check Ascend CANN VENC runtime status.
 
 By default this script only reads runtime/driver state. ``--probe`` creates a
-real VENC channel and can trigger driver-side memory pressure on failed CANN 8.0
-setups, so it also requires ``--i-understand-venc-probe-risk``.
+real VENC channel, and ``--encode-one-frame`` additionally sends one NV12 frame
+through VENC. These can trigger driver-side memory pressure on failed CANN 8.0
+setups, so probing also requires ``--i-understand-venc-probe-risk``.
 """
 
 from __future__ import annotations
@@ -113,7 +114,7 @@ def show_read_only_status() -> None:
     print(run_text(["bash", "-lc", "dmesg | grep -iE 'venc|h264e|h265e|encoder node|rc_' | tail -80"], timeout=5.0))
 
 
-def run_probe(width: int, height: int, fps: int, bitrate_kbps: int) -> int:
+def run_probe(width: int, height: int, fps: int, bitrate_kbps: int, encode_one_frame: bool) -> int:
     from webrtc_app.cann_encoder import CannVenc, collect_venc_diagnostics
 
     print("\n== VENC create probe ==")
@@ -121,6 +122,15 @@ def run_probe(width: int, height: int, fps: int, bitrate_kbps: int) -> int:
     venc = None
     try:
         venc = CannVenc(width=width, height=height, fps=fps, bitrate=bitrate_kbps)
+        if encode_one_frame:
+            import numpy as np
+
+            print("\n== VENC one-frame encode probe ==")
+            nv12 = np.empty((height * 3 // 2, width), dtype=np.uint8)
+            nv12[:height, :] = 16
+            nv12[height:, :] = 128
+            encoded = venc.encode(nv12, force_keyframe=True, pre_padded=False)
+            print(f"encoded_bytes={len(encoded)}")
         print("probe=OK")
         return 0
     except Exception as exc:
@@ -138,6 +148,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--join-usermemory", action="store_true", help="Join /sys/fs/cgroup/memory/usermemory before checks.")
     parser.add_argument("--probe", action="store_true", help="Create and destroy one CANN VENC channel.")
+    parser.add_argument("--encode-one-frame", action="store_true", help="With --probe, send one synthetic NV12 frame through VENC.")
     parser.add_argument(
         "--i-understand-venc-probe-risk",
         action="store_true",
@@ -152,6 +163,9 @@ def main() -> int:
     if args.join_usermemory:
         join_usermemory()
     show_read_only_status()
+    if args.encode_one_frame and not args.probe:
+        print("\nRefusing --encode-one-frame without --probe.")
+        return 3
     if args.probe:
         if not args.i_understand_venc_probe_risk:
             print(
@@ -159,7 +173,7 @@ def main() -> int:
                 "Use the read-only report first; repeated failed VENC create attempts can increase NPU/CMA memory usage."
             )
             return 3
-        return run_probe(args.width, args.height, args.fps, args.bitrate_kbps)
+        return run_probe(args.width, args.height, args.fps, args.bitrate_kbps, args.encode_one_frame)
     return 0
 
 

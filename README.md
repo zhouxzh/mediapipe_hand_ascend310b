@@ -1,105 +1,203 @@
 # MediaPipe Hand Ascend 310B
 
-这是一个独立的 MediaPipe Hand 复刻、验证和 Ascend 310B 移植子工程。工程目标不是封装成 pip 包，而是保留一套可以直接复制到开发板上的源码、模型、脚本和教程。
+This repository is the Ascend 310B deployment package for the MediaPipe Hand
+two-stage pipeline.
 
-当前源码分为两层：
-
-| 路径 | 作用 |
-| --- | --- |
-| `hand_pipeline/` | 可复用核心库：ImageToTensor 预处理、SSD anchor、palm decode、weighted NMS、ROI、landmark 反投影、TFLite 推理封装 |
-| `scripts/` | 可直接运行的 Python 程序：模型检查、palm 评估、两阶段评估、legacy graph 导出、baseline 汇总 |
-| `models/tflite/` | 当前 Tasks full 与 legacy full/lite TFLite 模型 |
-| `models/onnx/` | ONNX 转换输出目录，作为 ATC 输入 |
-| `models/om/` | Ascend 310B ATC 转换输出目录 |
-| `references/current_tasks/` | 当前 MediaPipe Tasks 参考输出，文件较大，默认不纳入版本管理 |
-| `runs/baseline/` | 当前验证结果输出目录，重新运行脚本即可生成 |
-| `doc/` | 教程和深度分析文档 |
-
-`runs/` 只保存生成结果，不作为源码维护。文档里不再手工维护历史数值表，所有速度和精度数据都以 `runs/baseline/verification_summary.md` 为准。
-
-当前使用两类人工校正数据：
-
-- `data/palm_datasets`：人工校验过的 palm box 和 7 个 palm keypoints，用于 palm detector 检测精度。
-- `data/handlm_datasets`：人工校正的 21 个手指关键点，用于 hand landmark 模型精度。
-
-## 模型
-
-`models/tflite/` 当前保留带来源和版本信息的模型名：
-
-| 模型 | 角色 | 输入 |
-| --- | --- | --- |
-| `mediapipe_task_hand_detector_full.tflite` | 当前 Tasks palm detector full | `1x192x192x3` |
-| `mediapipe_task_hand_landmark_full.tflite` | 当前 Tasks hand landmark full | `1x224x224x3` |
-| `mediapipe_legacy_0_10_14_palm_detection_full.tflite` | legacy palm detector full | `1x192x192x3` |
-| `mediapipe_legacy_0_10_14_palm_detection_lite.tflite` | legacy palm detector lite | `1x192x192x3` |
-| `mediapipe_legacy_0_10_14_hand_landmark_full.tflite` | legacy hand landmark full | `1x224x224x3` |
-| `mediapipe_legacy_0_10_14_hand_landmark_lite.tflite` | legacy hand landmark lite | `1x224x224x3` |
-
-重复别名模型已经删除。模型清单在 `models/tflite/model_version_manifest.json`。
-
-## 运行方式
-
-不需要安装本工程。建议在 `mediapipe_legacy` 环境中运行；这个环境安装了 `mediapipe==0.10.14` 和 `ai_edge_litert`，两步法 TFLite 推理和官方 legacy graph 对比可以在同一个环境完成：
-
-```bash
-conda activate mediapipe_legacy
-cd mediapipe_hand_ascend310b
-python scripts/run_baseline.py --split test --run-matrix
-```
-
-快速抽样验证：
-
-```bash
-python scripts/run_baseline.py --split test --run-matrix --max-images 300 --output-root runs/baseline_smoke
-```
-
-生成 full/lite 组合矩阵：
-
-```bash
-python scripts/run_baseline.py --run-matrix
-```
-
-核心输出：
+The deployed runtime is:
 
 ```text
-runs/baseline/
-  model_info.json
-  palm_detector/
-  two_stage_vs_current_tasks/
-  handlm_manual_gt/
-  legacy_graph/
-  two_stage_vs_legacy_graph/
-  legacy_rect_landmark/
-  verification_summary.json
-  verification_summary.md
+image/video frame
+  -> MediaPipe-style ImageToTensor preprocessing
+  -> palm detector OM
+  -> SSD decode + weighted NMS
+  -> rotated hand ROI crop
+  -> hand landmark OM
+  -> 21 landmarks projected back to the original frame
 ```
 
-## 速度和精度怎么看
+## Runtime Models
 
-`verification_summary.md` 会汇总当前 run 的关键指标：
+Production OM models:
 
-| 模块 | 精度指标 | 速度指标 |
-| --- | --- | --- |
-| palm detector | TP/FP/FN、precision、recall、AP、mAP | `total_mean_ms` |
-| two-stage vs current Tasks | 21 点 mean/median/p95 px、NME、PCK | `total_mean_ms` |
-| two-stage vs legacy graph | 复刻链路相对 legacy graph 的 21 点误差 | `total_mean_ms` |
-| legacy rect landmark | 排除 palm-to-rect 后的 landmark 子链路误差 | landmark 子链路验证 |
-| handlm manual GT | 对人工校正 21 点 GT 的 landmark full/lite 对比 | landmark 单模型耗时 |
-| tflite matrix | full/lite detector 与 landmark 组合对比 | 同一次 run 内横向比较 |
+```text
+models/om/mediapipe_legacy_0_10_14_palm_detection_full_downsample_resize_maxpool_slices_origin_dtype.om
+models/om/mediapipe_legacy_0_10_14_hand_landmark_full.om
+```
 
-判断误差来源时优先看两层：
+The palm detector OM is generated from the legacy full palm model through
+mathematically equivalent ONNX graph rewrites for 310B stability:
 
-1. `legacy_rect_landmark` 接近 0，说明 ROI crop、landmark TFLite、反投影基本正确。
-2. `two_stage_vs_legacy_graph` 当前也已经接近 0；如果后续在 310B 上回归，优先检查 detector 输入 tensor 是否仍使用 MediaPipe 风格的连续 ROI `warpPerspective` 采样，而不是普通 `resize + pad`。
+```text
+models/onnx/mediapipe_legacy_0_10_14_palm_detection_full.onnx
+  -> models/onnx/mediapipe_legacy_0_10_14_palm_detection_full_downsample_resize_maxpool_slices.onnx
+  -> models/om/mediapipe_legacy_0_10_14_palm_detection_full_downsample_resize_maxpool_slices_origin_dtype.om
+```
 
-## 310B 移植路线
+The original `mediapipe_legacy_0_10_14_palm_detection_full.om` is kept only as
+a conversion reference and is not the recommended deployment model.
 
-建议先固定 full 模型作为精度基线，再移植到 310B：
+## Board Environment
 
-1. 在 PC 上运行 `python scripts/run_baseline.py --split test --run-matrix`，确认 TFLite 参考链路稳定。
-2. 在 PC 的 `mediapipe_legacy` 环境中运行 `python scripts/export_onnx.py --group legacy_full`。
-3. 在 310B 上 source CANN 环境后运行 `python scripts/export_ascend_om.py --group legacy_full`；该脚本固定单线程 ATC。
-4. 逐层对齐输入 tensor、raw output、decoded palm、NMS、hand rect、ROI crop、landmark raw output 和最终 21 点。
-5. full 链路稳定后，再评估 lite 或 INT8 的速度收益。
+On the Ascend 310B board:
 
-详细教程见 [doc/README.md](doc/README.md)。
+```bash
+cd ~/Documents/mediapipe_hand_ascend310b
+source /usr/local/miniconda3/etc/profile.d/conda.sh
+conda activate base
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+```
+
+Install Python dependencies manually when needed:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+If the board has already installed `huggingface_hub==1.4.1` and pip reports a
+conflict with `tokenizers==0.19.1`, downgrade HF Hub to the pinned compatible
+version:
+
+```bash
+python -m pip install --upgrade --force-reinstall "huggingface_hub==0.36.2"
+python -m pip check
+```
+
+## Portable HaGRIDv2 MediaPipe Dataset
+
+The validation dataset is hosted as a Hugging Face dataset:
+
+```text
+zhouxzh/portable-hagridv2-mediapipe-hand
+```
+
+It is a Parquet dataset with embedded JPEG images. The exported metadata records
+`9754` images split as `train=7246`, `valid=845`, and `test=1663`. Labels include
+MediaPipe-style `palm_bbox_xyxy`, `palm7_keypoints`, and `full21_keypoints` in
+the `normalized_exported_image` coordinate system.
+
+On the Ascend 310B board, activate `base` and expose the user-local HF CLI:
+
+```bash
+cd ~/Documents/mediapipe_hand_ascend310b
+source /usr/local/miniconda3/etc/profile.d/conda.sh
+conda activate base
+export PATH="$HOME/.local/bin:$PATH"
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+Download only the test split for OM validation:
+
+```bash
+hf download zhouxzh/portable-hagridv2-mediapipe-hand \
+  test-00000.parquet dataset.json keypoints.json summary.json \
+  --repo-type dataset \
+  --local-dir data/portable-hagridv2-mediapipe-hand
+```
+
+Download the full dataset only when the board has stable storage and power:
+
+```bash
+hf download zhouxzh/portable-hagridv2-mediapipe-hand \
+  --repo-type dataset \
+  --local-dir data/portable-hagridv2-mediapipe-hand
+```
+
+If `hf` is not installed in the active environment, install the pinned versions
+from `requirements.txt` manually and rerun the commands above.
+
+Evaluate the downloaded test split with the deployed OM models:
+
+```bash
+python scripts/eval_hf_hand_dataset_om.py --model-set full --max-images 20 --save-vis 2
+```
+
+Run the full `1663` image test split for both full and lite OM models:
+
+```bash
+python scripts/eval_hf_hand_dataset_om.py --model-set full,lite
+```
+
+Add `--run-onnx` only when you also need ONNX reference metrics. Reports are
+written under `runs/hf_hand_dataset_om/`.
+
+## Validate ONNX vs OM
+
+Run the video conversion checks:
+
+```bash
+python scripts/run_video_onnx_om_checks.py --video video/test.mp4
+```
+
+This runs two checks:
+
+- `optimized`: optimized palm ONNX vs final optimized palm OM, checking the
+  exact ATC input graph against the deployed OM.
+- `original`: original legacy full palm ONNX vs final optimized palm OM,
+  checking that the final OM has no end-to-end regression relative to the
+  original model graph.
+
+Quick smoke test:
+
+```bash
+python scripts/run_video_onnx_om_checks.py --video video/test.mp4 --max-frames 5 --save-vis 2
+```
+
+Outputs are written under `runs/video_onnx_om_compare/`.
+
+## Reproduce The OM Model
+
+To rebuild the production palm OM on the board:
+
+```bash
+python scripts/build_optimized_palm_om.py \
+  --skip-rewrite \
+  --compile-om \
+  --optimized-onnx models/onnx/mediapipe_legacy_0_10_14_palm_detection_full_downsample_resize_maxpool_slices.onnx \
+  --om-output models/om/mediapipe_legacy_0_10_14_palm_detection_full_downsample_resize_maxpool_slices_origin_dtype \
+  --atc-log runs/palm_om/atc_logs/downsample_resize_maxpool_slices_origin_dtype.log \
+  --precision-mode must_keep_origin_dtype
+```
+
+To regenerate the optimized ONNX graph before ATC:
+
+```bash
+python scripts/build_optimized_palm_om.py \
+  --input-onnx models/onnx/mediapipe_legacy_0_10_14_palm_detection_full.onnx \
+  --optimized-onnx models/onnx/mediapipe_legacy_0_10_14_palm_detection_full_downsample_resize_maxpool_slices.onnx
+```
+
+The individual graph rewrite scripts are kept in `scripts/` so the conversion
+can be debugged and reproduced.
+
+## Realtime WebRTC Demo
+
+```bash
+python scripts/webrtc_hand_om_app.py \
+  --source /dev/video0 \
+  --camera-width 1280 \
+  --camera-height 720 \
+  --camera-fps 30 \
+  --camera-backend opencv \
+  --camera-fourcc MJPG \
+  --encoder-mode cpu \
+  --port 8080
+```
+
+Open the printed URL from a browser.
+
+## Repository Layout
+
+```text
+hand_pipeline/   Core preprocessing, decode, ROI, OM runtime, visualization
+scripts/         Board deployment, validation, and OM reproduction entry points
+models/onnx/     ONNX reference graphs
+models/om/       Ascend 310B OM models
+video/           Test videos
+web/             WebRTC browser client
+webrtc_app/      Camera, DVPP, and CANN encoder helpers
+doc/             Historical migration and error analysis notes
+runs/            Generated validation outputs
+```
+
+The code is intended to run directly from the copied repository; installing the
+repository itself as a package is not required.
