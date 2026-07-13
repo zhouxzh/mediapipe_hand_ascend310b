@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
 import numpy as np
 
@@ -12,6 +13,10 @@ ACL_MEMCPY_HOST_TO_DEVICE = 1
 ACL_MEMCPY_DEVICE_TO_HOST = 2
 ACL_ALREADY_INITIALIZED = 100002
 acl = None
+_ACL_RUNTIME_LOCK = threading.Lock()
+_ACL_RUNTIME_REFCOUNT = 0
+_ACL_RUNTIME_INITIALIZED_HERE = False
+_ACL_RUNTIME_CAN_FINALIZE = False
 
 
 def _load_acl():
@@ -65,33 +70,75 @@ class PersistentAclRuntime:
         self.context = None
         self.stream = None
         self._initialized = False
+        self._registered = False
         self._init()
 
     def _init(self) -> None:
-        ret = self.acl.init()
-        if ret not in (0, ACL_ALREADY_INITIALIZED):
-            _check_ret(ret, "acl.init")
-        self._initialized = True
-        _check_ret(self.acl.rt.set_device(self.device_id), "acl.rt.set_device")
-        self.context, ret = self.acl.rt.create_context(self.device_id)
-        _check_ret(ret, "acl.rt.create_context")
-        self.stream, ret = self.acl.rt.create_stream()
-        _check_ret(ret, "acl.rt.create_stream")
+        global _ACL_RUNTIME_CAN_FINALIZE
+        global _ACL_RUNTIME_INITIALIZED_HERE
+        global _ACL_RUNTIME_REFCOUNT
+
+        with _ACL_RUNTIME_LOCK:
+            initialized_here = False
+            if _ACL_RUNTIME_REFCOUNT == 0:
+                ret = self.acl.init()
+                if ret not in (0, ACL_ALREADY_INITIALIZED):
+                    _check_ret(ret, "acl.init")
+                initialized_here = ret == 0
+                _ACL_RUNTIME_INITIALIZED_HERE = initialized_here
+                _ACL_RUNTIME_CAN_FINALIZE = initialized_here and self.finalize_on_release
+
+            try:
+                _check_ret(self.acl.rt.set_device(self.device_id), "acl.rt.set_device")
+                self.context, ret = self.acl.rt.create_context(self.device_id)
+                _check_ret(ret, "acl.rt.create_context")
+                self.stream, ret = self.acl.rt.create_stream()
+                _check_ret(ret, "acl.rt.create_stream")
+            except Exception:
+                if self.stream is not None:
+                    self.acl.rt.destroy_stream(self.stream)
+                    self.stream = None
+                if self.context is not None:
+                    self.acl.rt.destroy_context(self.context)
+                    self.context = None
+                if _ACL_RUNTIME_REFCOUNT == 0 and initialized_here:
+                    self.acl.rt.reset_device(self.device_id)
+                    self.acl.finalize()
+                    _ACL_RUNTIME_INITIALIZED_HERE = False
+                    _ACL_RUNTIME_CAN_FINALIZE = False
+                raise
+
+            if _ACL_RUNTIME_REFCOUNT > 0:
+                _ACL_RUNTIME_CAN_FINALIZE = _ACL_RUNTIME_CAN_FINALIZE and self.finalize_on_release
+            _ACL_RUNTIME_REFCOUNT += 1
+            self._registered = True
+            self._initialized = True
 
     def set_context(self) -> None:
         if self.context is not None and hasattr(self.acl.rt, "set_context"):
             _check_ret(self.acl.rt.set_context(self.context), "acl.rt.set_context")
 
     def release(self) -> None:
+        global _ACL_RUNTIME_CAN_FINALIZE
+        global _ACL_RUNTIME_INITIALIZED_HERE
+        global _ACL_RUNTIME_REFCOUNT
+
         if self.stream is not None:
             self.acl.rt.destroy_stream(self.stream)
             self.stream = None
         if self.context is not None:
             self.acl.rt.destroy_context(self.context)
             self.context = None
-        if self._initialized and self.finalize_on_release:
-            self.acl.rt.reset_device(self.device_id)
-            self.acl.finalize()
+        if self._registered:
+            with _ACL_RUNTIME_LOCK:
+                _ACL_RUNTIME_REFCOUNT = max(0, _ACL_RUNTIME_REFCOUNT - 1)
+                if _ACL_RUNTIME_REFCOUNT == 0:
+                    if _ACL_RUNTIME_INITIALIZED_HERE and _ACL_RUNTIME_CAN_FINALIZE:
+                        self.acl.rt.reset_device(self.device_id)
+                        self.acl.finalize()
+                    _ACL_RUNTIME_INITIALIZED_HERE = False
+                    _ACL_RUNTIME_CAN_FINALIZE = False
+            self._registered = False
         self._initialized = False
 
     close = release

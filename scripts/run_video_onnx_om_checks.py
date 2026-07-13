@@ -53,7 +53,7 @@ CASES = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--video", default="video/test.mp4")
+    parser.add_argument("--video", default="data/eval_videos/test.mp4")
     parser.add_argument("--output-root", default="runs/video_onnx_om_compare")
     parser.add_argument("--cases", nargs="+", choices=sorted(CASES), default=["optimized", "original"])
     parser.add_argument("--max-frames", type=int, default=0)
@@ -66,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-det", type=int, default=20)
     parser.add_argument("--max-hands", type=int, default=2)
     parser.add_argument("--min-hand-score", type=float, default=0.5)
+    parser.add_argument("--pipeline-mode", choices=["tracking", "image"], default="tracking")
     parser.add_argument("--match-iou", type=float, default=0.1)
     parser.add_argument("--max-mean-hand21-px", type=float, default=2.0)
     parser.add_argument("--max-p95-hand21-px", type=float, default=5.0)
@@ -107,6 +108,8 @@ def run_case(args: argparse.Namespace, case: CheckCase, output_dir: Path) -> dic
         str(args.max_hands),
         "--min-hand-score",
         str(args.min_hand_score),
+        "--pipeline-mode",
+        args.pipeline_mode,
         "--match-iou",
         str(args.match_iou),
         "--frame-stride",

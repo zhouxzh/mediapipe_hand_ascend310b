@@ -7,7 +7,9 @@ import argparse
 import csv
 import json
 import math
+import ssl  # noqa: F401 - preload the intended OpenSSL runtime before pyarrow on Ascend images.
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -21,11 +23,21 @@ import cv2
 import numpy as np
 import pyarrow.parquet as pq
 
+from hand_pipeline.decode import generate_palm_anchors
 from hand_pipeline.eval import IOU_THRESHOLDS
 from hand_pipeline.eval import PalmPrediction
 from hand_pipeline.eval import PalmTarget
 from hand_pipeline.eval import box_iou
 from hand_pipeline.eval import detection_metrics
+from hand_pipeline.om_runtime import PersistentAclModel
+from hand_pipeline.om_runtime import PersistentAclRuntime
+from hand_pipeline.outputs import pick_landmark_outputs
+from hand_pipeline.roi import hand_roi_from_normalized_rect
+from hand_pipeline.roi import normalized_rect_from_palm_detection
+from hand_pipeline.roi import preprocess_landmark_tflite
+from hand_pipeline.roi import project_landmarks_with_normalized_rect
+from hand_pipeline.tracking import TrackingConfig
+from hand_pipeline.tracking import run_palm_detector
 from hand_pipeline.two_stage import OmHandPipeline
 from hand_pipeline.two_stage import OnnxHandPipeline
 from hand_pipeline.visualization import draw_hand_predictions
@@ -33,6 +45,7 @@ from hand_pipeline.visualization import draw_hand_predictions
 
 DEFAULT_DATASET = "data/portable-hagridv2-mediapipe-hand/test-00000.parquet"
 DEFAULT_OUTPUT_ROOT = "runs/hf_hand_dataset_om"
+DEFAULT_COMPONENTS = "cascade,palm,landmark"
 
 MODEL_SETS = {
     "full": {
@@ -50,6 +63,17 @@ MODEL_SETS = {
         "required": False,
     },
 }
+
+
+def model_set_paths(model_sets: list[str]) -> dict[str, dict[str, str]]:
+    return {
+        name: {
+            key: str(resolve_path(value))
+            for key, value in MODEL_SETS[name].items()
+            if key.endswith("_detector") or key.endswith("_landmark")
+        }
+        for name in model_sets
+    }
 
 
 @dataclass(frozen=True)
@@ -295,7 +319,7 @@ def match_targets_to_predictions(
         used_pred.add(matched)
         pred = predictions[matched]
         pred_palm7 = np.asarray(pred["palm7"], dtype=np.float32)
-        pred_hand21 = np.asarray(pred["hand21"], dtype=np.float32)
+        pred_hand21 = np.asarray(pred["hand21"], dtype=np.float32)[:, :2]
         palm7_err = np.linalg.norm(pred_palm7 - target.palm7.astype(np.float32), axis=1)
         hand21_err = np.linalg.norm(pred_hand21 - target.hand21.astype(np.float32), axis=1)
         box_abs = np.abs(np.asarray(pred["box"], dtype=np.float32) - target.box.astype(np.float32))
@@ -428,6 +452,7 @@ def make_om_pipeline(args: argparse.Namespace, spec: dict[str, Any]) -> OmHandPi
         device_id=args.device_id,
         reload_detector_each_frame=args.reload_detector_each_frame,
         finalize_on_release=False,
+        mode="image",
         **pipeline_kwargs(args),
     )
 
@@ -436,19 +461,27 @@ def make_onnx_pipeline(args: argparse.Namespace, spec: dict[str, Any]) -> OnnxHa
     return OnnxHandPipeline(
         resolve_path(spec["onnx_detector"]),
         resolve_path(spec["onnx_landmark"]),
+        mode="image",
         **pipeline_kwargs(args),
     )
 
 
-def check_model_files(model_sets: list[str], run_onnx: bool) -> None:
+def check_model_files(model_sets: list[str], run_onnx: bool, components: list[str]) -> None:
     missing: list[Path] = []
     for name in model_sets:
         spec = MODEL_SETS[name]
-        for key in ("om_detector", "om_landmark"):
+        om_keys: list[str] = []
+        if "cascade" in components:
+            om_keys.extend(["om_detector", "om_landmark"])
+        if "palm" in components:
+            om_keys.append("om_detector")
+        if "landmark" in components:
+            om_keys.append("om_landmark")
+        for key in sorted(set(om_keys)):
             path = resolve_path(spec[key])
             if not path.exists():
                 missing.append(path)
-        if run_onnx:
+        if run_onnx and "cascade" in components:
             for key in ("onnx_detector", "onnx_landmark"):
                 path = resolve_path(spec[key])
                 if not path.exists():
@@ -456,6 +489,18 @@ def check_model_files(model_sets: list[str], run_onnx: bool) -> None:
     if missing:
         lines = "\n".join(f"  - {path}" for path in missing)
         raise FileNotFoundError(f"Missing model file(s):\n{lines}")
+
+
+def apply_model_path_overrides(args: argparse.Namespace) -> None:
+    overrides = {
+        ("full", "om_detector"): args.full_om_detector,
+        ("full", "om_landmark"): args.full_om_landmark,
+        ("lite", "om_detector"): args.lite_om_detector,
+        ("lite", "om_landmark"): args.lite_om_landmark,
+    }
+    for (model_set, key), path_text in overrides.items():
+        if path_text:
+            MODEL_SETS[model_set][key] = path_text
 
 
 def evaluate_backend(
@@ -572,6 +617,355 @@ def evaluate_backend(
     }
 
 
+def normalize_components(text: str) -> list[str]:
+    if text.strip().lower() == "all":
+        return ["cascade", "palm", "landmark"]
+    names = [item.strip().lower() for item in text.split(",") if item.strip()]
+    if not names:
+        raise ValueError("--components cannot be empty")
+    valid = {"cascade", "palm", "landmark"}
+    unknown = [name for name in names if name not in valid]
+    if unknown:
+        raise ValueError(f"Unknown component(s): {unknown}. Available: {sorted(valid)}")
+    output: list[str] = []
+    for name in names:
+        if name not in output:
+            output.append(name)
+    return output
+
+
+def palm_detection_rows(row: DatasetRow, detections: list[Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "image_id": row.image_id,
+            "image_name": row.image_name,
+            "pred_index": pred_index,
+            "score": float(det.score),
+            "box": np.asarray(det.box, dtype=np.float32),
+            "palm7": np.asarray(det.keypoints, dtype=np.float32),
+        }
+        for pred_index, det in enumerate(detections)
+    ]
+
+
+def palm_rows_to_predictions(rows: list[dict[str, Any]]) -> list[PalmPrediction]:
+    return [
+        PalmPrediction(
+            image_id=int(row["image_id"]),
+            image_name=str(row["image_name"]),
+            score=float(row["score"]),
+            box=np.asarray(row["box"], dtype=np.float32),
+            palm7=np.asarray(row["palm7"], dtype=np.float32),
+        )
+        for row in rows
+    ]
+
+
+def match_palm_targets_to_predictions(
+    targets: list[HandTarget],
+    predictions: list[dict[str, Any]],
+    iou_threshold: float,
+) -> tuple[list[dict[str, Any]], int, int]:
+    rows: list[dict[str, Any]] = []
+    if not targets and not predictions:
+        return rows, 0, 0
+    if not targets:
+        return rows, 0, len(predictions)
+    if not predictions:
+        return rows, len(targets), 0
+
+    pred_boxes = np.stack([np.asarray(pred["box"], dtype=np.float32) for pred in predictions], axis=0)
+    used_pred: set[int] = set()
+    for target in sorted(targets, key=lambda item: item.target_index):
+        ious = box_iou(target.box.astype(np.float32), pred_boxes)
+        order = np.argsort(ious)[::-1]
+        matched = None
+        for pos in order:
+            pred_index = int(pos)
+            if pred_index in used_pred:
+                continue
+            if float(ious[pred_index]) >= iou_threshold:
+                matched = pred_index
+                break
+        if matched is None:
+            continue
+        used_pred.add(matched)
+        pred = predictions[matched]
+        pred_palm7 = np.asarray(pred["palm7"], dtype=np.float32)
+        palm7_err = np.linalg.norm(pred_palm7 - target.palm7.astype(np.float32), axis=1)
+        box_abs = np.abs(np.asarray(pred["box"], dtype=np.float32) - target.box.astype(np.float32))
+        norm = max(float(np.linalg.norm(target.box[[2, 3]] - target.box[[0, 1]])), 1e-6)
+        rows.append(
+            {
+                "image_id": target.image_id,
+                "image_name": target.image_name,
+                "target_index": target.target_index,
+                "pred_index": matched,
+                "gesture_label": target.gesture_label,
+                "match_iou": float(ious[matched]),
+                "score": float(pred["score"]),
+                "box_mean_abs_px": float(np.mean(box_abs)),
+                "box_max_abs_px": float(np.max(box_abs)),
+                "palm7_mean_px": float(np.mean(palm7_err)),
+                "palm7_p95_px": float(np.percentile(palm7_err, 95)),
+                "palm7_max_px": float(np.max(palm7_err)),
+                "palm7_nme": float(np.mean(palm7_err) / norm),
+                "palm7_pck_001": float(np.mean(palm7_err <= 0.01 * norm)),
+                "palm7_pck_005": float(np.mean(palm7_err <= 0.05 * norm)),
+            }
+        )
+    return rows, len(targets) - len(rows), len(predictions) - len(used_pred)
+
+
+def evaluate_palm_model(
+    *,
+    backend_name: str,
+    detector_model: PersistentAclModel,
+    dataset_rows: list[DatasetRow],
+    targets_map: dict[str, list[PalmTarget]],
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> dict[str, Any]:
+    anchors = generate_palm_anchors()
+    config = TrackingConfig(
+        score_threshold=args.score_threshold,
+        nms_iou=args.nms_iou,
+        max_det=args.max_det,
+        max_hands=args.max_hands,
+        min_hand_score=args.min_hand_score,
+    )
+    all_predictions: list[dict[str, Any]] = []
+    palm_predictions: list[PalmPrediction] = []
+    per_image_rows: list[dict[str, Any]] = []
+    match_rows: list[dict[str, Any]] = []
+    timing: dict[str, list[float]] = {
+        "preprocess": [],
+        "detector": [],
+        "decode": [],
+        "total": [],
+    }
+
+    for index, row in enumerate(dataset_rows):
+        det_timing, detections = run_palm_detector(row.image_bgr, detector_model.infer, anchors, config)
+        predictions = palm_detection_rows(row, detections)
+        all_predictions.extend(predictions)
+        palm_predictions.extend(palm_rows_to_predictions(predictions))
+        frame_matches, unmatched_gt, unmatched_pred = match_palm_targets_to_predictions(
+            row.targets,
+            predictions,
+            args.palm_match_iou,
+        )
+        match_rows.extend(frame_matches)
+        preprocess_ms = float(det_timing["det_pre_ms"])
+        detector_ms = float(det_timing["det_infer_ms"])
+        decode_ms = float(det_timing["det_decode_ms"])
+        total_ms = preprocess_ms + detector_ms + decode_ms
+        timing["preprocess"].append(preprocess_ms)
+        timing["detector"].append(detector_ms)
+        timing["decode"].append(decode_ms)
+        timing["total"].append(total_ms)
+        per_image_rows.append(
+            {
+                "image_id": row.image_id,
+                "image_name": row.image_name,
+                "gesture_label": row.gesture_label,
+                "width": row.width,
+                "height": row.height,
+                "gt_palms": len(row.targets),
+                "pred_palms": len(predictions),
+                "matched_palms": len(frame_matches),
+                "unmatched_gt": unmatched_gt,
+                "unmatched_pred": unmatched_pred,
+                "preprocess_ms": preprocess_ms,
+                "detector_ms": detector_ms,
+                "decode_ms": decode_ms,
+                "total_ms": total_ms,
+            }
+        )
+        if args.progress_interval and (index + 1) % args.progress_interval == 0:
+            print(f"[{backend_name}] {index + 1}/{len(dataset_rows)}", flush=True)
+
+    detection = detection_metrics(palm_predictions, targets_map, args.score_threshold, 0.50)
+    gt_count = sum(len(row.targets) for row in dataset_rows)
+    pred_count = len(all_predictions)
+    unmatched_gt_total = sum(int(row["unmatched_gt"]) for row in per_image_rows)
+    unmatched_pred_total = sum(int(row["unmatched_pred"]) for row in per_image_rows)
+    summary: dict[str, Any] = {
+        "backend": backend_name,
+        "component": "palm",
+        "match_iou": args.palm_match_iou,
+        "images": len(dataset_rows),
+        "gt_palms": gt_count,
+        "pred_palms": pred_count,
+        "matched_palms": len(match_rows),
+        "unmatched_gt": unmatched_gt_total,
+        "unmatched_pred": unmatched_pred_total,
+        "unmatched_gt_rate": unmatched_gt_total / max(gt_count, 1),
+        "unmatched_pred_rate": unmatched_pred_total / max(pred_count, 1),
+        "detection": detection,
+        **summarize([float(row["box_mean_abs_px"]) for row in match_rows], "box_mean_abs_px"),
+        **summarize([float(row["box_max_abs_px"]) for row in match_rows], "box_max_abs_px"),
+        **summarize([float(row["palm7_mean_px"]) for row in match_rows], "palm7_mean_px"),
+        **summarize([float(row["palm7_p95_px"]) for row in match_rows], "palm7_p95_px"),
+        **summarize([float(row["palm7_max_px"]) for row in match_rows], "palm7_max_px"),
+        **summarize([float(row["palm7_nme"]) for row in match_rows], "palm7_nme"),
+        **summarize([float(row["palm7_pck_001"]) for row in match_rows], "palm7_pck_001"),
+        **summarize([float(row["palm7_pck_005"]) for row in match_rows], "palm7_pck_005"),
+    }
+    for key, values in timing.items():
+        summary.update(summarize_ms(values, key))
+
+    serializable_predictions = [
+        {
+            **{key: value for key, value in row.items() if key not in {"box", "palm7"}},
+            "box": np.asarray(row["box"], dtype=np.float32).astype(float).tolist(),
+            "palm7": np.asarray(row["palm7"], dtype=np.float32).astype(float).tolist(),
+        }
+        for row in all_predictions
+    ]
+    write_csv(output_dir / "per_image.csv", per_image_rows)
+    write_csv(output_dir / "matches.csv", match_rows)
+    write_json(output_dir / "predictions.json", serializable_predictions)
+    write_json(output_dir / "summary.json", summary)
+    write_palm_model_report(output_dir / "report.md", summary)
+    return {"summary": summary, "predictions": serializable_predictions}
+
+
+def evaluate_landmark_model(
+    *,
+    backend_name: str,
+    landmark_model: PersistentAclModel,
+    dataset_rows: list[DatasetRow],
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> dict[str, Any]:
+    per_image_rows: list[dict[str, Any]] = []
+    per_hand_rows: list[dict[str, Any]] = []
+    timing: dict[str, list[float]] = {
+        "roi": [],
+        "landmark": [],
+        "post": [],
+        "total": [],
+        "image_total": [],
+    }
+
+    for index, row in enumerate(dataset_rows):
+        image_total_ms = 0.0
+        image_evaluated = 0
+        for target in sorted(row.targets, key=lambda item: item.target_index):
+            roi_start = time.perf_counter()
+            palm_roi = normalized_rect_from_palm_detection(target.box, target.palm7, row.width, row.height)
+            roi = hand_roi_from_normalized_rect(row.image_bgr, palm_roi)
+            lm_tensor = preprocess_landmark_tflite(roi.crop)
+            roi_ms = (time.perf_counter() - roi_start) * 1000.0
+
+            landmark_start = time.perf_counter()
+            outputs_raw = landmark_model.infer(lm_tensor)
+            landmark_ms = (time.perf_counter() - landmark_start) * 1000.0
+
+            post_start = time.perf_counter()
+            outputs = pick_landmark_outputs(outputs_raw)
+            pred_hand21 = project_landmarks_with_normalized_rect(
+                outputs.landmarks,
+                palm_roi,
+                row.width,
+                row.height,
+                input_size=224,
+                coord_scale="auto",
+            )[:, :2]
+            post_ms = (time.perf_counter() - post_start) * 1000.0
+
+            total_ms = roi_ms + landmark_ms + post_ms
+            image_total_ms += total_ms
+            image_evaluated += 1
+            hand21_err = np.linalg.norm(pred_hand21.astype(np.float32) - target.hand21.astype(np.float32), axis=1)
+            norm = max(float(np.linalg.norm(target.box[[2, 3]] - target.box[[0, 1]])), 1e-6)
+            row_record = {
+                "image_id": target.image_id,
+                "image_name": target.image_name,
+                "target_index": target.target_index,
+                "gesture_label": target.gesture_label,
+                "hand_score": float(outputs.hand_score),
+                "handedness": float(outputs.handedness),
+                "hand_score_passed": bool(math.isnan(outputs.hand_score) or outputs.hand_score > args.min_hand_score),
+                "full21_mean_px": float(np.mean(hand21_err)),
+                "full21_median_px": float(np.median(hand21_err)),
+                "full21_p95_px": float(np.percentile(hand21_err, 95)),
+                "full21_max_px": float(np.max(hand21_err)),
+                "full21_nme": float(np.mean(hand21_err) / norm),
+                "full21_pck_001": float(np.mean(hand21_err <= 0.01 * norm)),
+                "full21_pck_005": float(np.mean(hand21_err <= 0.05 * norm)),
+                "roi_center_x_px": float(roi.center[0]),
+                "roi_center_y_px": float(roi.center[1]),
+                "roi_size_px": float(roi.size),
+                "roi_rotation_rad": float(roi.rotation),
+                "roi_ms": roi_ms,
+                "landmark_ms": landmark_ms,
+                "post_ms": post_ms,
+                "total_ms": total_ms,
+            }
+            per_hand_rows.append(row_record)
+            timing["roi"].append(roi_ms)
+            timing["landmark"].append(landmark_ms)
+            timing["post"].append(post_ms)
+            timing["total"].append(total_ms)
+        timing["image_total"].append(image_total_ms)
+        per_image_rows.append(
+            {
+                "image_id": row.image_id,
+                "image_name": row.image_name,
+                "gesture_label": row.gesture_label,
+                "width": row.width,
+                "height": row.height,
+                "gt_hands": len(row.targets),
+                "evaluated_hands": image_evaluated,
+                "image_total_ms": image_total_ms,
+            }
+        )
+        if args.progress_interval and (index + 1) % args.progress_interval == 0:
+            print(f"[{backend_name}] {index + 1}/{len(dataset_rows)}", flush=True)
+
+    gt_count = sum(len(row.targets) for row in dataset_rows)
+    score_passed = sum(1 for row in per_hand_rows if bool(row["hand_score_passed"]))
+    passed_rows = [row for row in per_hand_rows if bool(row["hand_score_passed"])]
+    failed_rows = [row for row in per_hand_rows if not bool(row["hand_score_passed"])]
+    summary: dict[str, Any] = {
+        "backend": backend_name,
+        "component": "landmark",
+        "roi_source": "dataset_palm_bbox_palm7",
+        "images": len(dataset_rows),
+        "gt_hands": gt_count,
+        "evaluated_hands": len(per_hand_rows),
+        "hand_score_passed": score_passed,
+        "hand_score_failed": len(failed_rows),
+        "hand_score_pass_rate": score_passed / max(len(per_hand_rows), 1),
+        **summarize([float(row["hand_score"]) for row in per_hand_rows], "hand_score"),
+        **summarize([float(row["full21_mean_px"]) for row in per_hand_rows], "full21_mean_px"),
+        **summarize([float(row["full21_median_px"]) for row in per_hand_rows], "full21_median_px"),
+        **summarize([float(row["full21_p95_px"]) for row in per_hand_rows], "full21_p95_px"),
+        **summarize([float(row["full21_max_px"]) for row in per_hand_rows], "full21_max_px"),
+        **summarize([float(row["full21_nme"]) for row in per_hand_rows], "full21_nme"),
+        **summarize([float(row["full21_pck_001"]) for row in per_hand_rows], "full21_pck_001"),
+        **summarize([float(row["full21_pck_005"]) for row in per_hand_rows], "full21_pck_005"),
+        **summarize([float(row["full21_mean_px"]) for row in passed_rows], "passed_full21_mean_px"),
+        **summarize([float(row["full21_p95_px"]) for row in passed_rows], "passed_full21_p95_px"),
+        **summarize([float(row["full21_max_px"]) for row in passed_rows], "passed_full21_max_px"),
+        **summarize([float(row["full21_nme"]) for row in passed_rows], "passed_full21_nme"),
+        **summarize([float(row["full21_pck_001"]) for row in passed_rows], "passed_full21_pck_001"),
+        **summarize([float(row["full21_pck_005"]) for row in passed_rows], "passed_full21_pck_005"),
+        **summarize([float(row["full21_mean_px"]) for row in failed_rows], "failed_full21_mean_px"),
+        **summarize([float(row["full21_p95_px"]) for row in failed_rows], "failed_full21_p95_px"),
+    }
+    for key, values in timing.items():
+        summary.update(summarize_ms(values, key))
+
+    write_csv(output_dir / "per_image.csv", per_image_rows)
+    write_csv(output_dir / "per_hand.csv", per_hand_rows)
+    write_json(output_dir / "summary.json", summary)
+    write_landmark_model_report(output_dir / "report.md", summary)
+    return {"summary": summary}
+
+
 def full_passed(summary: dict[str, Any], args: argparse.Namespace) -> bool:
     detection = summary["detection"]
     return bool(
@@ -644,16 +1038,107 @@ def write_backend_report(path: Path, summary: dict[str, Any]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def write_palm_model_report(path: Path, summary: dict[str, Any]) -> None:
+    detection = summary["detection"]
+    lines = [
+        f"# {summary['backend']} Palm Model Evaluation",
+        "",
+        "This evaluates only the palm detector OM against dataset palm bbox and 7 keypoint labels.",
+        "",
+        "## Counts",
+        "",
+        "| Item | Value |",
+        "| --- | ---: |",
+        f"| images | {summary['images']} |",
+        f"| GT palms | {summary['gt_palms']} |",
+        f"| predicted palms | {summary['pred_palms']} |",
+        f"| matched palms | {summary['matched_palms']} |",
+        f"| match IoU | {fmt(summary['match_iou'], 2)} |",
+        f"| unmatched GT rate | {fmt(summary['unmatched_gt_rate'], 6)} |",
+        "",
+        "## Detection",
+        "",
+        "| Metric | Value |",
+        "| --- | ---: |",
+        f"| precision | {fmt(detection['precision'], 6)} |",
+        f"| recall | {fmt(detection['recall'], 6)} |",
+        f"| miss rate | {fmt(detection['miss_rate'], 6)} |",
+        f"| AP@0.50 | {fmt(detection['ap@0.50'], 6)} |",
+        f"| AP@0.75 | {fmt(detection['ap@0.75'], 6)} |",
+        f"| mAP@0.50:0.95 | {fmt(detection['map@0.50:0.95'], 6)} |",
+        "",
+        "## Palm Label Error",
+        "",
+        "| Metric | Mean | P95 | Max |",
+        "| --- | ---: | ---: | ---: |",
+        f"| box mean abs px | {fmt(summary['box_mean_abs_px_mean'])} | {fmt(summary['box_mean_abs_px_p95'])} | {fmt(summary['box_mean_abs_px_max'])} |",
+        f"| palm7 mean px | {fmt(summary['palm7_mean_px_mean'])} | {fmt(summary['palm7_mean_px_p95'])} | {fmt(summary['palm7_mean_px_max'])} |",
+        f"| palm7 NME | {fmt(summary['palm7_nme_mean'], 6)} | {fmt(summary['palm7_nme_p95'], 6)} | {fmt(summary['palm7_nme_max'], 6)} |",
+        f"| palm7 PCK@0.01 | {fmt(summary['palm7_pck_001_mean'], 6)} | {fmt(summary['palm7_pck_001_p95'], 6)} | {fmt(summary['palm7_pck_001_max'], 6)} |",
+        f"| palm7 PCK@0.05 | {fmt(summary['palm7_pck_005_mean'], 6)} | {fmt(summary['palm7_pck_005_p95'], 6)} | {fmt(summary['palm7_pck_005_max'], 6)} |",
+        "",
+        "## Timing",
+        "",
+        "| Stage | Mean ms | Median ms | P95 ms | Max ms |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    for key in ("preprocess", "detector", "decode", "total"):
+        lines.append(
+            f"| {key} | {fmt(summary[f'{key}_mean_ms'])} | {fmt(summary[f'{key}_median_ms'])} | "
+            f"{fmt(summary[f'{key}_p95_ms'])} | {fmt(summary[f'{key}_max_ms'])} |"
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_landmark_model_report(path: Path, summary: dict[str, Any]) -> None:
+    lines = [
+        f"# {summary['backend']} Landmark Model Evaluation",
+        "",
+        "This evaluates only the landmark OM. The ROI is built from dataset palm bbox and palm7 labels.",
+        "",
+        "## Counts",
+        "",
+        "| Item | Value |",
+        "| --- | ---: |",
+        f"| images | {summary['images']} |",
+        f"| GT hands | {summary['gt_hands']} |",
+        f"| evaluated hands | {summary['evaluated_hands']} |",
+        f"| hand score failed | {summary['hand_score_failed']} |",
+        f"| hand score pass rate | {fmt(summary['hand_score_pass_rate'], 6)} |",
+        "",
+        "## Full21 Error",
+        "",
+        "| Metric | All Mean | All P95 | Passed Mean | Passed P95 | Max |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+        f"| full21 mean px | {fmt(summary['full21_mean_px_mean'])} | {fmt(summary['full21_mean_px_p95'])} | {fmt(summary['passed_full21_mean_px_mean'])} | {fmt(summary['passed_full21_mean_px_p95'])} | {fmt(summary['full21_mean_px_max'])} |",
+        f"| full21 NME | {fmt(summary['full21_nme_mean'], 6)} | {fmt(summary['full21_nme_p95'], 6)} | {fmt(summary['passed_full21_nme_mean'], 6)} | {fmt(summary['passed_full21_nme_p95'], 6)} | {fmt(summary['full21_nme_max'], 6)} |",
+        f"| full21 PCK@0.01 | {fmt(summary['full21_pck_001_mean'], 6)} | {fmt(summary['full21_pck_001_p95'], 6)} | {fmt(summary['passed_full21_pck_001_mean'], 6)} | {fmt(summary['passed_full21_pck_001_p95'], 6)} | {fmt(summary['full21_pck_001_max'], 6)} |",
+        f"| full21 PCK@0.05 | {fmt(summary['full21_pck_005_mean'], 6)} | {fmt(summary['full21_pck_005_p95'], 6)} | {fmt(summary['passed_full21_pck_005_mean'], 6)} | {fmt(summary['passed_full21_pck_005_p95'], 6)} | {fmt(summary['full21_pck_005_max'], 6)} |",
+        "",
+        "## Timing",
+        "",
+        "| Stage | Mean ms | Median ms | P95 ms | Max ms |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    for key in ("roi", "landmark", "post", "total", "image_total"):
+        lines.append(
+            f"| {key} | {fmt(summary[f'{key}_mean_ms'])} | {fmt(summary[f'{key}_median_ms'])} | "
+            f"{fmt(summary[f'{key}_p95_ms'])} | {fmt(summary[f'{key}_max_ms'])} |"
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def write_summary_report(path: Path, report: dict[str, Any]) -> None:
     lines = [
         "# Portable HaGRIDv2 OM Dataset Evaluation",
         "",
         f"- dataset: `{report['dataset']}`",
         f"- images: `{report['images']}`",
+        f"- components: `{','.join(report['components'])}`",
         f"- output_dir: `{report['output_dir']}`",
         f"- overall_passed: `{report['overall_passed']}`",
         "",
-        "## Model Sets",
+        "## Cascade Model Sets",
         "",
         "| Model | Enforced | Passed | Recall | AP50 | Full21 mean px | Full21 P95 px | Total mean ms |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -668,6 +1153,43 @@ def write_summary_report(path: Path, report: dict[str, Any]) -> None:
             f"{fmt(summary['full21_mean_px_mean'])} | {fmt(summary['full21_mean_px_p95'])} | "
             f"{fmt(summary['total_mean_ms'])} |"
         )
+    if report.get("palm_model_results"):
+        lines.extend(
+            [
+                "",
+                "## Palm Model",
+                "",
+                "| Model | Recall | AP50 | AP75 | mAP50:95 | Box mean abs px | Palm7 mean px | Detector mean ms | Total mean ms |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for item in report["palm_model_results"]:
+            summary = item["summary"]
+            detection = summary["detection"]
+            lines.append(
+                f"| {item['model_set']} | {fmt(detection['recall'], 6)} | {fmt(detection['ap@0.50'], 6)} | "
+                f"{fmt(detection['ap@0.75'], 6)} | {fmt(detection['map@0.50:0.95'], 6)} | "
+                f"{fmt(summary['box_mean_abs_px_mean'])} | {fmt(summary['palm7_mean_px_mean'])} | "
+                f"{fmt(summary['detector_mean_ms'])} | {fmt(summary['total_mean_ms'])} |"
+            )
+    if report.get("landmark_model_results"):
+        lines.extend(
+            [
+                "",
+                "## Landmark Model",
+                "",
+                "| Model | ROI source | Full21 mean px | Passed full21 mean px | Passed full21 P95 px | PCK@0.05 passed | Hand score pass | Landmark mean ms | Total mean ms/hand |",
+                "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for item in report["landmark_model_results"]:
+            summary = item["summary"]
+            lines.append(
+                f"| {item['model_set']} | {summary['roi_source']} | {fmt(summary['full21_mean_px_mean'])} | "
+                f"{fmt(summary['passed_full21_mean_px_mean'])} | {fmt(summary['passed_full21_mean_px_p95'])} | "
+                f"{fmt(summary['passed_full21_pck_005_mean'], 6)} | {fmt(summary['hand_score_pass_rate'], 6)} | "
+                f"{fmt(summary['landmark_mean_ms'])} | {fmt(summary['total_mean_ms'])} |"
+            )
     if report.get("onnx_comparisons"):
         lines.extend(
             [
@@ -706,9 +1228,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--model-set", default="full,lite")
+    parser.add_argument("--components", default=DEFAULT_COMPONENTS, help="Comma-separated: cascade,palm,landmark, or all")
     parser.add_argument("--max-images", type=int, default=0)
     parser.add_argument("--save-vis", type=int, default=0)
     parser.add_argument("--run-onnx", action="store_true")
+    parser.add_argument("--full-om-detector", default="", help="Override full palm OM path")
+    parser.add_argument("--full-om-landmark", default="", help="Override full landmark OM path")
+    parser.add_argument("--lite-om-detector", default="", help="Override lite palm OM path")
+    parser.add_argument("--lite-om-landmark", default="", help="Override lite landmark OM path")
     parser.add_argument("--fail-on-lite", action="store_true")
     parser.add_argument("--device-id", type=int, default=0)
     parser.add_argument("--score-threshold", type=float, default=0.5)
@@ -720,6 +1247,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shift-y", type=float, default=-0.5)
     parser.add_argument("--rotation-offset-degrees", type=float, default=0.0)
     parser.add_argument("--landmark-match-iou", type=float, default=0.10)
+    parser.add_argument("--palm-match-iou", type=float, default=0.50)
     parser.add_argument("--reload-detector-each-frame", action="store_true")
     parser.add_argument("--progress-interval", type=int, default=50)
     parser.add_argument("--min-recall", type=float, default=0.95)
@@ -732,11 +1260,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    apply_model_path_overrides(args)
     dataset_path = resolve_path(args.dataset)
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset parquet not found: {dataset_path}")
     model_sets = normalize_model_set(args.model_set)
-    check_model_files(model_sets, args.run_onnx)
+    components = normalize_components(args.components)
+    check_model_files(model_sets, args.run_onnx, components)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_root = resolve_path(args.output_root) / timestamp
@@ -754,59 +1284,100 @@ def main() -> int:
             "images": len(dataset_rows),
             "gt_hands": sum(len(row.targets) for row in dataset_rows),
             "max_images": args.max_images,
+            "components": components,
+            "model_paths": model_set_paths(model_sets),
         },
     )
 
     model_results: list[dict[str, Any]] = []
+    palm_model_results: list[dict[str, Any]] = []
+    landmark_model_results: list[dict[str, Any]] = []
     onnx_comparisons: list[dict[str, Any]] = []
     for model_set in model_sets:
         spec = MODEL_SETS[model_set]
         model_dir = output_root / model_set
         model_dir.mkdir(parents=True, exist_ok=True)
-        print(f"== Evaluate OM {model_set} ==", flush=True)
-        om_pipeline = make_om_pipeline(args, spec)
-        try:
-            om_result = evaluate_backend(
-                backend_name=f"{model_set}_om",
-                pipeline=om_pipeline,
-                dataset_rows=dataset_rows,
-                targets_map=targets_map,
-                args=args,
-                output_dir=model_dir / "om",
-                save_vis_prefix=f"{model_set}_om",
-            )
-        finally:
-            om_pipeline.close()
-        enforce = model_set == "full" or args.fail_on_lite
-        add_threshold_verdict(om_result["summary"], args, enforce=enforce)
-        write_json(model_dir / "om" / "summary.json", om_result["summary"])
-        write_backend_report(model_dir / "om" / "report.md", om_result["summary"])
-        model_results.append({"model_set": model_set, **om_result})
+        if "cascade" in components:
+            print(f"== Evaluate cascade OM {model_set} ==", flush=True)
+            om_pipeline = make_om_pipeline(args, spec)
+            try:
+                om_result = evaluate_backend(
+                    backend_name=f"{model_set}_om",
+                    pipeline=om_pipeline,
+                    dataset_rows=dataset_rows,
+                    targets_map=targets_map,
+                    args=args,
+                    output_dir=model_dir / "om",
+                    save_vis_prefix=f"{model_set}_om",
+                )
+            finally:
+                om_pipeline.close()
+            enforce = model_set == "full" or args.fail_on_lite
+            add_threshold_verdict(om_result["summary"], args, enforce=enforce)
+            write_json(model_dir / "om" / "summary.json", om_result["summary"])
+            write_backend_report(model_dir / "om" / "report.md", om_result["summary"])
+            model_results.append({"model_set": model_set, **om_result})
 
-        if args.run_onnx:
-            print(f"== Evaluate ONNX {model_set} ==", flush=True)
-            onnx_pipeline = make_onnx_pipeline(args, spec)
-            onnx_result = evaluate_backend(
-                backend_name=f"{model_set}_onnx",
-                pipeline=onnx_pipeline,
-                dataset_rows=dataset_rows,
-                targets_map=targets_map,
-                args=args,
-                output_dir=model_dir / "onnx",
-                save_vis_prefix=f"{model_set}_onnx",
-            )
-            rows, om_unmatched, onnx_unmatched = compare_prediction_sets(
-                om_result["predictions"],
-                onnx_result["predictions"],
-                args.landmark_match_iou,
-            )
-            comparison = {
-                "model_set": model_set,
-                "summary": summarize_comparison(rows, om_unmatched, onnx_unmatched),
-            }
-            onnx_comparisons.append(comparison)
-            write_csv(model_dir / "om_vs_onnx_matches.csv", rows)
-            write_json(model_dir / "om_vs_onnx_summary.json", comparison["summary"])
+            if args.run_onnx:
+                print(f"== Evaluate ONNX {model_set} ==", flush=True)
+                onnx_pipeline = make_onnx_pipeline(args, spec)
+                onnx_result = evaluate_backend(
+                    backend_name=f"{model_set}_onnx",
+                    pipeline=onnx_pipeline,
+                    dataset_rows=dataset_rows,
+                    targets_map=targets_map,
+                    args=args,
+                    output_dir=model_dir / "onnx",
+                    save_vis_prefix=f"{model_set}_onnx",
+                )
+                rows, om_unmatched, onnx_unmatched = compare_prediction_sets(
+                    om_result["predictions"],
+                    onnx_result["predictions"],
+                    args.landmark_match_iou,
+                )
+                comparison = {
+                    "model_set": model_set,
+                    "summary": summarize_comparison(rows, om_unmatched, onnx_unmatched),
+                }
+                onnx_comparisons.append(comparison)
+                write_csv(model_dir / "om_vs_onnx_matches.csv", rows)
+                write_json(model_dir / "om_vs_onnx_summary.json", comparison["summary"])
+
+        single_components = [name for name in ("palm", "landmark") if name in components]
+        if single_components:
+            runtime = PersistentAclRuntime(device_id=args.device_id, finalize_on_release=False)
+            try:
+                if "palm" in single_components:
+                    print(f"== Evaluate palm OM {model_set} ==", flush=True)
+                    detector_model = PersistentAclModel(resolve_path(spec["om_detector"]), runtime=runtime)
+                    try:
+                        palm_result = evaluate_palm_model(
+                            backend_name=f"{model_set}_palm_om",
+                            detector_model=detector_model,
+                            dataset_rows=dataset_rows,
+                            targets_map=targets_map,
+                            args=args,
+                            output_dir=model_dir / "palm_om",
+                        )
+                    finally:
+                        detector_model.release()
+                    palm_model_results.append({"model_set": model_set, **palm_result})
+                if "landmark" in single_components:
+                    print(f"== Evaluate landmark OM {model_set} ==", flush=True)
+                    landmark_model = PersistentAclModel(resolve_path(spec["om_landmark"]), runtime=runtime)
+                    try:
+                        landmark_result = evaluate_landmark_model(
+                            backend_name=f"{model_set}_landmark_om",
+                            landmark_model=landmark_model,
+                            dataset_rows=dataset_rows,
+                            args=args,
+                            output_dir=model_dir / "landmark_om",
+                        )
+                    finally:
+                        landmark_model.release()
+                    landmark_model_results.append({"model_set": model_set, **landmark_result})
+            finally:
+                runtime.release()
 
     overall_passed = all(
         item["summary"].get("passed") is not False
@@ -819,28 +1390,106 @@ def main() -> int:
         "output_dir": str(output_root),
         "images": len(dataset_rows),
         "model_sets": model_sets,
+        "model_paths": model_set_paths(model_sets),
+        "components": components,
         "run_onnx": args.run_onnx,
         "overall_passed": overall_passed,
         "model_results": [{"model_set": item["model_set"], "summary": item["summary"]} for item in model_results],
+        "palm_model_results": [
+            {"model_set": item["model_set"], "summary": item["summary"]} for item in palm_model_results
+        ],
+        "landmark_model_results": [
+            {"model_set": item["model_set"], "summary": item["summary"]} for item in landmark_model_results
+        ],
         "onnx_comparisons": onnx_comparisons,
     }
     write_json(output_root / "summary.json", report)
     write_summary_report(output_root / "summary.md", report)
+    summary_rows: list[dict[str, Any]] = []
+    for item in model_results:
+        summary = item["summary"]
+        summary_rows.append(
+            {
+                "component": "cascade",
+                "model_set": item["model_set"],
+                "enforced": summary["thresholds"]["enforced"],
+                "passed": summary["passed"],
+                "recall": summary["detection"]["recall"],
+                "ap50": summary["detection"]["ap@0.50"],
+                "ap75": summary["detection"]["ap@0.75"],
+                "map50_95": summary["detection"]["map@0.50:0.95"],
+                "box_mean_abs_px": math.nan,
+                "palm7_mean_px": summary["palm7_mean_px_mean"],
+                "full21_mean_px": summary["full21_mean_px_mean"],
+                "full21_p95_px": summary["full21_mean_px_p95"],
+                "passed_full21_mean_px": math.nan,
+                "passed_full21_p95_px": math.nan,
+                "preprocess_mean_ms": summary["preprocess_mean_ms"],
+                "detector_mean_ms": summary["detector_mean_ms"],
+                "decode_mean_ms": summary["decode_mean_ms"],
+                "roi_mean_ms": summary["roi_mean_ms"],
+                "landmark_mean_ms": summary["landmark_mean_ms"],
+                "post_mean_ms": summary["post_mean_ms"],
+                "total_mean_ms": summary["total_mean_ms"],
+            }
+        )
+    for item in palm_model_results:
+        summary = item["summary"]
+        summary_rows.append(
+            {
+                "component": "palm",
+                "model_set": item["model_set"],
+                "enforced": False,
+                "passed": None,
+                "recall": summary["detection"]["recall"],
+                "ap50": summary["detection"]["ap@0.50"],
+                "ap75": summary["detection"]["ap@0.75"],
+                "map50_95": summary["detection"]["map@0.50:0.95"],
+                "box_mean_abs_px": summary["box_mean_abs_px_mean"],
+                "palm7_mean_px": summary["palm7_mean_px_mean"],
+                "full21_mean_px": math.nan,
+                "full21_p95_px": math.nan,
+                "passed_full21_mean_px": math.nan,
+                "passed_full21_p95_px": math.nan,
+                "preprocess_mean_ms": summary["preprocess_mean_ms"],
+                "detector_mean_ms": summary["detector_mean_ms"],
+                "decode_mean_ms": summary["decode_mean_ms"],
+                "roi_mean_ms": math.nan,
+                "landmark_mean_ms": math.nan,
+                "post_mean_ms": math.nan,
+                "total_mean_ms": summary["total_mean_ms"],
+            }
+        )
+    for item in landmark_model_results:
+        summary = item["summary"]
+        summary_rows.append(
+            {
+                "component": "landmark",
+                "model_set": item["model_set"],
+                "enforced": False,
+                "passed": None,
+                "recall": math.nan,
+                "ap50": math.nan,
+                "ap75": math.nan,
+                "map50_95": math.nan,
+                "box_mean_abs_px": math.nan,
+                "palm7_mean_px": math.nan,
+                "full21_mean_px": summary["full21_mean_px_mean"],
+                "full21_p95_px": summary["full21_mean_px_p95"],
+                "passed_full21_mean_px": summary["passed_full21_mean_px_mean"],
+                "passed_full21_p95_px": summary["passed_full21_mean_px_p95"],
+                "preprocess_mean_ms": math.nan,
+                "detector_mean_ms": math.nan,
+                "decode_mean_ms": math.nan,
+                "roi_mean_ms": summary["roi_mean_ms"],
+                "landmark_mean_ms": summary["landmark_mean_ms"],
+                "post_mean_ms": summary["post_mean_ms"],
+                "total_mean_ms": summary["total_mean_ms"],
+            }
+        )
     write_csv(
         output_root / "summary.csv",
-        [
-            {
-                "model_set": item["model_set"],
-                "enforced": item["summary"]["thresholds"]["enforced"],
-                "passed": item["summary"]["passed"],
-                "recall": item["summary"]["detection"]["recall"],
-                "ap50": item["summary"]["detection"]["ap@0.50"],
-                "full21_mean_px": item["summary"]["full21_mean_px_mean"],
-                "full21_p95_px": item["summary"]["full21_mean_px_p95"],
-                "total_mean_ms": item["summary"]["total_mean_ms"],
-            }
-            for item in model_results
-        ],
+        summary_rows,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2, default=json_default))
     return 0 if overall_passed else 2

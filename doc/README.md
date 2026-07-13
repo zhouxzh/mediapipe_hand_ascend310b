@@ -1,49 +1,72 @@
-# MediaPipe Hand Ascend 310B 文档
+# MediaPipe Hand Ascend 310B Documentation
 
-本目录只保留当前部署需要的说明和少量可追溯记录。旧的单次调试文档、失败实验日志和已经被合并的结果文档已删除；当前可执行命令以仓库根目录 `README.md` 和 `scripts/README.md` 为准。
+This directory keeps the current deployment notes, validation records, and
+PianoVAM evaluation reports for the MediaPipe hand pipeline on Ascend 310B.
+Historical one-off debug logs are intentionally kept out of this index. Use the
+repository root `README.md` and `scripts/README.md` for runnable command
+references.
 
-## 当前状态
+## Current Status
 
-正式部署模型：
+Default deployment models:
 
 ```text
 models/om/mediapipe_legacy_0_10_14_palm_detection_full_downsample_resize_maxpool_slices_origin_dtype.om
 models/om/mediapipe_legacy_0_10_14_hand_landmark_full.om
 ```
 
-正式结论：
+Current conclusions:
 
-- 当前默认部署使用 legacy full palm optimized OM + legacy full landmark OM。
-- full 模型在 `ascend20t` 上完成 Portable HaGRIDv2 MediaPipe test 全量 `1663` 张图片评估，并通过正式阈值。
-- 20T 上重新 ATC 编译得到的 full OM 与现有 full OM 原始输出完全一致，当前不需要保留 20T 专用 full OM。
-- lite 组合可以运行并生成报告，但默认是 `report-only`，不作为正式验收模型。
-- 失败或明显错误的 direct palm OM 不再保留在 `models/om/` 中。
+- The default deployment uses the legacy full optimized `origin_dtype` palm
+  detector OM plus the legacy full hand landmark OM.
+- Video and WebRTC default to MediaPipe-style tracking. Dataset acceptance
+  still uses independent image-mode evaluation unless the report explicitly
+  states that it is a video tracking evaluation.
+- Full-class models have been evaluated on both the 8T and 20T boards using the
+  Portable HaGRIDv2 MediaPipe test set with 1663 images. The board-results
+  table includes current `origin_dtype` defaults and mix-precision full-model
+  comparison candidates.
+- The full OM rebuilt on the 20T board matches the current full OM raw outputs,
+  so a separate 20T-specific full OM is not required.
+- Full PianoVAM legacy CPU image evaluation shows that independent-frame misses
+  are dominated by palm-stage under-detection rather than hand-landmark failure.
+- Ascend 8T full-video PianoVAM tracking evaluation shows that the OM tracking
+  pipeline is highly consistent with the PianoVAM `Handskeleton` pseudo labels
+  and the MediaPipe Tasks GPU tracking baseline, but it is still below real-time
+  for 60 FPS video.
+- Lite models can run and generate reports, but they are report-only candidates,
+  not default acceptance models.
+- Failed or clearly incorrect direct palm OM variants are not kept in
+  `models/om/`.
 
-20T 全量数据集结果：
+## Documents
 
-| 模型 | 状态 | Precision | Recall | AP50 | mAP50:95 | Full21 mean px | Full21 P95 px | Total mean ms |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| full | passed | `0.996399` | `0.997596` | `0.994933` | `0.994755` | `0.127865` | `0.247230` | `21.353` |
-| lite | report-only | `0.978877` | `0.974760` | `0.983212` | `0.645321` | `1.318512` | `2.481823` | `19.900` |
-
-完整 8T/20T 精度和速度对比见 [板端验证结果](05_board_validation_results.md)。
-
-## 文档列表
-
-| 文档 | 作用 |
+| Document | Purpose |
 | --- | --- |
-| [01_pipeline_graph.md](01_pipeline_graph.md) | MediaPipe Hand 两阶段链路、legacy graph 对应关系和验证分层 |
-| [02_data_structures.md](02_data_structures.md) | 预处理、anchor、palm detection、ROI、landmark 输出等核心数据结构 |
-| [03_models.md](03_models.md) | 当前保留的模型资产、正式模型和 lite 候选模型 |
-| [04_webrtc_runtime.md](04_webrtc_runtime.md) | WebRTC 实时运行、摄像头参数、VENC/DVPP 边界 |
-| [05_board_validation_results.md](05_board_validation_results.md) | 8T/20T、full/lite、精度/速度统一对比记录 |
-| [06_lite_palm_status.md](06_lite_palm_status.md) | lite palm 的算子差异、失败路径、8T 候选和当前部署判断 |
-| [07_om_conversion_reproduction.md](07_om_conversion_reproduction.md) | full palm OM 为什么需要 downsample/resize/maxpool 改写，以及如何复现 ATC |
+| [01_pipeline_graph.md](01_pipeline_graph.md) | MediaPipe Hand two-stage pipeline, legacy graph mapping, and validation layers. |
+| [02_data_structures.md](02_data_structures.md) | Core preprocessing, anchor, palm detection, ROI, and landmark data structures. |
+| [03_models.md](03_models.md) | Current model assets, default models, speed candidates, lite candidates, and removed OM variants. |
+| [04_webrtc_runtime.md](04_webrtc_runtime.md) | WebRTC runtime design, camera ingestion, VENC/DVPP boundaries, and OM integration. |
+| [05_board_validation_results.md](05_board_validation_results.md) | Unified 8T/20T model validation, speed, lite status, and OM rebuild records. |
+| [06_tracking_algorithm.md](06_tracking_algorithm.md) | Video/WebRTC tracking state machine, ROI loopback behavior, and debug conclusions. |
+| [07_amct_int8_quantization_8t_20t_results.md](07_amct_int8_quantization_8t_20t_results.md) | AMCT INT8 quantization results on 8T and 20T boards. |
+| [08_pianovam_video_tracking_performance.md](08_pianovam_video_tracking_performance.md) | Legacy MediaPipe tracking analysis on PianoVAM sample frames. |
+| [09_pianovam_mediapipe_tasks_gpu_tracking.md](09_pianovam_mediapipe_tasks_gpu_tracking.md) | Full PianoVAM test split tracking analysis using MediaPipe Tasks GPU on ace2. |
+| [10_pianovam_mediapipe_tasks_cpu_image.md](10_pianovam_mediapipe_tasks_cpu_image.md) | Full PianoVAM test split image-mode analysis using MediaPipe Tasks CPU on ace2. |
+| [11_pianovam_tasks_image_vs_tracking.md](11_pianovam_tasks_image_vs_tracking.md) | Direct full-test comparison between MediaPipe Tasks image mode and video tracking mode. |
+| [12_pianovam_legacy_cpu_image_palm_stage.md](12_pianovam_legacy_cpu_image_palm_stage.md) | Full PianoVAM test split legacy CPU image analysis with palm-stage and landmark-stage diagnosis. |
+| [13_pianovam_ascend8t_vs_mediapipe_tracking.md](13_pianovam_ascend8t_vs_mediapipe_tracking.md) | Full-video comparison between Ascend 8T OM tracking, MediaPipe Tasks GPU tracking, and PianoVAM Handskeleton pseudo labels. |
+| [14_ascend20t_system_instability_record.md](14_ascend20t_system_instability_record.md) | Ascend 20T system instability record for the `opiaipro_20t_ubuntu22.04_desktop_aarch64_20250211.img` image, ext4 errors, conda crashes, and recovery criteria. |
 
-## 维护规则
+## Maintenance Rules
 
-- 新的正式验收结果写入 [05_board_validation_results.md](05_board_validation_results.md)，并同步更新本 README 的摘要表。
-- 如果新增 OM 模型，必须说明它是 `正式默认`、`report-only`、`候选` 还是 `历史失败路径`。
-- 不能通过精度验证的 palm OM 不放入 `models/om/`。
-- 如果不同开发板 ATC 输出没有数值差异，不保留按板卡命名的重复 OM。
-- 历史脚本和旧路径不再写入 `doc/README.md`；需要运行命令时看根目录 `README.md` 和 `scripts/README.md`。
+- New formal board validation results should update
+  [05_board_validation_results.md](05_board_validation_results.md) and this
+  index if they change the deployment recommendation.
+- New OM files must be classified as default, report-only, candidate, or
+  historical failed path.
+- Palm OM variants that fail accuracy validation should not be added to
+  `models/om/`.
+- If ATC outputs from different boards are numerically identical, do not keep
+  duplicate board-specific OM files.
+- Documentation in this directory must be written in English.

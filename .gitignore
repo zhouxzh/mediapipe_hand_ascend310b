@@ -22,5 +22,11 @@ models/onnx/*
 models/om/*
 !models/om/README.md
 models/tflite/*
+
+# Local datasets and generated transfer archives.
+data/
+mediapipe_tasks_cpu_image_annotations.tar.gz
+__sync_ascend8t.tar
+
 video/*
 

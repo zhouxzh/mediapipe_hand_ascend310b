@@ -96,6 +96,7 @@ class V4l2RawCapture:
         self._buffers: list[tuple[mmap.mmap, int]] = []
         self._thread: Optional[threading.Thread] = None
         self._running = threading.Event()
+        self._resource_lock = threading.Lock()
         self._queue: queue.Queue = queue.Queue(maxsize=2)
         self._dropped = 0
         self._captured = 0
@@ -111,6 +112,8 @@ class V4l2RawCapture:
     def start(self) -> None:
         if self._running.is_set():
             return
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError("Previous V4L2 capture thread is still stopping")
 
         self._fd = os.open(self._device, os.O_RDWR)
         try:
@@ -119,8 +122,8 @@ class V4l2RawCapture:
             self._init_mmap()
             self._start_stream()
         except Exception:
-            os.close(self._fd)
-            self._fd = -1
+            self._stop_stream()
+            self._close_device_resources()
             raise
 
         self._running.set()
@@ -217,6 +220,8 @@ class V4l2RawCapture:
                 try:
                     fcntl.ioctl(self._fd, _VIDIOC_DQBUF, dbuf)
                 except OSError:
+                    if not self._running.is_set():
+                        break
                     continue
 
                 if not self._running.is_set():
@@ -247,35 +252,48 @@ class V4l2RawCapture:
             if self._running.is_set():
                 logger.exception("V4L2 capture loop error")
         finally:
+            self._running.clear()
             self._stop_stream()
+            self._close_device_resources()
 
     def _stop_stream(self) -> None:
-        if self._fd >= 0:
+        with self._resource_lock:
+            fd = self._fd
+        if fd >= 0:
             try:
                 buf = array.array("i", [_V4L2_BUF_TYPE_VIDEO_CAPTURE])
-                fcntl.ioctl(self._fd, _VIDIOC_STREAMOFF, buf)
+                fcntl.ioctl(fd, _VIDIOC_STREAMOFF, buf)
             except OSError:
                 pass
+
+    def _close_device_resources(self) -> None:
+        with self._resource_lock:
+            for mapped, _ in self._buffers:
+                try:
+                    mapped.close()
+                except Exception:
+                    pass
+            self._buffers.clear()
+            if self._fd >= 0:
+                try:
+                    os.close(self._fd)
+                except OSError:
+                    pass
+                self._fd = -1
 
     def read(self, timeout: float = 1.0) -> bytes:
         return self._queue.get(timeout=timeout)
 
     def stop(self) -> None:
         self._running.clear()
+        self._stop_stream()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=2.0)
-        for m, _ in self._buffers:
-            try:
-                m.close()
-            except Exception:
-                pass
-        self._buffers.clear()
-        if self._fd >= 0:
-            try:
-                os.close(self._fd)
-            except OSError:
-                pass
-            self._fd = -1
+        if self._thread is not None and self._thread.is_alive():
+            logger.warning("V4L2 capture thread did not stop within 2 seconds; deferring device cleanup")
+        else:
+            self._thread = None
+            self._close_device_resources()
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()

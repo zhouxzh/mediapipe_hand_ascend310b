@@ -1,160 +1,164 @@
-# 核心数据结构
+# Core Data Structures
 
-本文件解释本工程复刻 MediaPipe Hand 时用到的核心数据结构，以及两个人工校正数据集如何进入 baseline。
+This document explains the main data structures used to reproduce the
+MediaPipe Hands pipeline and how the validation datasets enter the baseline.
 
 ## 1. `LetterboxInfo`
 
-Palm detector 的输入不是直接把原图拉伸到正方形，也不是简单的 `resize + copyMakeBorder`。legacy `PalmDetectionCpu` 内部使用 `ImageToTensorCalculator`：先构造带 padding 的 full-image ROI，再用连续坐标 `warpPerspective` 直接采样到 `192x192`。
+The palm detector input is not produced by stretching the original image to a
+square, and it is not the same as a simple `resize + copyMakeBorder` path. The
+legacy `PalmDetectionCpu` subgraph uses `ImageToTensorCalculator`: it builds a
+full-image ROI with keep-aspect-ratio padding and samples directly into the
+`192x192` detector tensor with continuous coordinates.
 
 ```text
-原图 HxW
+source image HxW
   -> full-image ROI(center_x, center_y, roi_width, roi_height)
-  -> keep_aspect_ratio 扩展 ROI，得到 normalized padding
-  -> warpPerspective 采样
+  -> keep-aspect-ratio ROI expansion and normalized padding
+  -> warpPerspective sampling
   -> RGB float32 NHWC [1, 192, 192, 3], range [0, 1]
 ```
 
-`LetterboxInfo` 保存两类信息：
+`LetterboxInfo` stores two kinds of values:
 
-| 字段 | 作用 |
+| Field | Purpose |
 | --- | --- |
-| `orig_width / orig_height` | 原图尺寸，用于把归一化坐标映射回像素坐标 |
-| `resized_width / resized_height` | 等效缩放后的整数尺寸，仅用于调试和兼容说明 |
-| `pad_left / pad_top / pad_right / pad_bottom` | 等效整数 padding，仅用于调试和兼容说明 |
-| `normalized_padding_values` | MediaPipe 连续 ROI 产生的真实 padding，用于 detector 输出坐标反变换 |
+| `orig_width / orig_height` | Source image size for mapping normalized coordinates back to pixels. |
+| `resized_width / resized_height` | Integer-equivalent resized dimensions, used only for debugging and compatibility notes. |
+| `pad_left / pad_top / pad_right / pad_bottom` | Integer-equivalent padding, used only for debugging and compatibility notes. |
+| `normalized_padding_values` | The actual continuous MediaPipe padding used to unpad detector output coordinates. |
 
-Palm detector 输出坐标处在带 padding 的归一化 tensor 坐标系中。解码时必须使用 `normalized_padding_values` 去掉 padding，再映射回原图像素坐标。这里如果用整数 padding 近似，最终 21 点会出现 1px 级系统误差。
+Palm detector coordinates are expressed in the padded normalized tensor
+coordinate system. Decode must remove `normalized_padding_values` before
+mapping detections back to source pixels. Using integer padding here introduces
+systematic pixel-level drift in the final 21 landmarks.
 
-## 2. `Anchor`
+## 2. Palm Anchors
 
-MediaPipe palm detector 是 SSD 风格检测器。模型不是直接输出框，而是相对固定 anchor 输出偏移量。
+The MediaPipe palm detector is SSD-style. The model predicts offsets relative
+to fixed anchors rather than direct boxes.
 
-本工程使用的 anchor 参数：
+Current anchor parameters:
 
-| 参数 | 值 |
-| --- | --- |
-| input size | `192` |
-| num layers | `4` |
-| strides | `[8, 16, 16, 16]` |
-| min/max scale | `0.1484375 / 0.75` |
-| aspect ratios | `[1.0]` |
-| interpolated scale aspect ratio | `1.0` |
-| fixed anchor size | `true` |
-| anchor count | `2016` |
+| Parameter | Value |
+| --- | ---: |
+| input size | `192x192` |
+| strides | `8, 16, 16, 16` |
+| feature map sizes | `24x24`, `12x12`, `12x12`, `12x12` |
+| anchors per location | `2` |
+| total anchors | `2016` |
+| fixed anchor size | `1.0` |
 
-anchor 数量来自：
+The total anchor count is:
 
 ```text
-stride 8:  24 x 24 x 2 = 1152
-stride 16: 12 x 12 x 6 = 864
-total: 2016
+24 * 24 * 2 + 12 * 12 * 2 * 3 = 2016
 ```
 
-## 3. `PalmDetection`
+## 3. Palm Detection Output
 
-Palm detector 输出：
+Palm detector outputs:
 
-| 输出 | shape | 含义 |
+| Output | Shape | Meaning |
 | --- | --- | --- |
-| `Identity` | `[1, 2016, 18]` | 每个 anchor 的 box + 7 个 palm keypoints |
-| `Identity_1` | `[1, 2016, 1]` | 每个 anchor 的分类 logit |
+| `Identity` | `[1, 2016, 18]` | Box plus 7 palm keypoints for each anchor. |
+| `Identity_1` | `[1, 2016, 1]` | Classification logit for each anchor. |
 
-`18` 维结构：
+The 18 values are:
 
 ```text
-[x_center, y_center, width, height,
- kp0_x, kp0_y,
- ...
- kp6_x, kp6_y]
+[x_center, y_center, w, h,
+ kp0_x, kp0_y, ..., kp6_x, kp6_y]
 ```
 
-解码之后执行：
+Decode steps:
 
-1. `sigmoid` 得到 score。
-2. 过滤低分 anchor。
-3. 使用 `LetterboxInfo.normalized_padding` 去掉 ImageToTensor padding。
-4. 映射回原图像素坐标。
-5. weighted NMS 合并重叠检测。
+1. Apply `sigmoid` to scores.
+2. Filter low-score anchors.
+3. Remove ImageToTensor normalized padding with `LetterboxInfo`.
+4. Map normalized coordinates back to source image pixels.
+5. Merge overlapping detections with weighted NMS.
 
-`data/palm_datasets` 中的 GT 是人工校验过的 palm box 和 7 个 palm keypoints，因此它是 palm detector 精度的主要验收数据。
+The `data/palm_datasets` ground truth contains manually checked palm boxes and
+7 palm keypoints and is the main acceptance set for palm detector accuracy.
 
-## 4. `HandRoi`
+## 4. Hand ROI
 
-MediaPipe 不会把 palm box 直接送给 landmark 模型，而是根据 palm box 和 palm keypoints 构造旋转手部 ROI。
+MediaPipe does not feed the palm box directly into the landmark model. It
+builds a rotated hand ROI from the palm box and palm keypoints.
 
-`HandRoi` 保存：
+`HandRoi` stores:
 
-| 字段 | 含义 |
+| Field | Meaning |
 | --- | --- |
-| `center` | ROI 中心点，像素坐标 |
-| `size` | 正方形 ROI 边长，像素 |
-| `rotation` | ROI 旋转角，弧度 |
-| `matrix` | 原图到 `224x224` crop 的仿射矩阵 |
-| `inverse` | `224x224` crop 到原图的逆仿射矩阵 |
-| `crop` | landmark 模型输入图像 |
+| `center` | ROI center in source-image pixels. |
+| `size` | Square ROI side length in pixels. |
+| `rotation` | ROI rotation in radians. |
+| `matrix` | Affine transform from source image to `224x224` crop. |
+| `inverse` | Inverse affine transform from crop coordinates back to source image. |
+| `crop` | Landmark model input image. |
 
-当前 palm-to-hand-rect 参数：
+Current palm-to-hand-rect parameters:
 
-| 参数 | 值 |
-| --- | --- |
-| rotation start keypoint | `0` |
-| rotation end keypoint | `2` |
-| target angle | `90 deg` |
-| scale | `2.6` |
-| shift_y | `-0.5` |
-| landmark input | `224x224` |
+| Parameter | Value |
+| --- | ---: |
+| shift x | `0.0` |
+| shift y | `-0.5` |
+| scale x | `2.6` |
+| scale y | `2.6` |
+| square long | enabled |
 
-裁剪使用 `cv2.warpAffine(..., borderMode=cv2.BORDER_REPLICATE)`。边界模式不同会影响手在图像边缘时的 landmark 输入。
+Cropping uses `cv2.warpAffine(..., borderMode=cv2.BORDER_REPLICATE)`. Border
+mode affects landmark inputs when hands are near image edges.
 
-## 5. Hand Landmark 输出
+## 5. Hand Landmark Output
 
-Hand landmark 模型输入：
+Hand landmark model input:
 
 ```text
 RGB float32 NHWC [1, 224, 224, 3], range [0, 1]
 ```
 
-输出：
+Outputs:
 
-| 输出 | shape | 含义 |
+| Output | Shape | Meaning |
 | --- | --- | --- |
-| `Identity` | `[1, 63]` | 21 个 ROI 内 landmark，每点 `x, y, z` |
-| `Identity_1` | `[1, 1]` | hand presence / hand score |
-| `Identity_2` | `[1, 1]` | handedness |
-| `Identity_3` | `[1, 63]` | world landmarks |
+| `Identity` | `[1, 63]` | 21 ROI-space landmarks, each with `x, y, z`. |
+| hand score output | scalar | Hand-presence score. |
+| handedness output | scalar/classification | Left/right hand classification. |
+| world landmark output | `[1, 63]` | 21 world-space landmarks. |
 
-`Identity` reshape 为 `[21, 3]`。其中 `x, y` 位于 ROI 坐标系，再通过 `HandRoi.inverse` 反投影回原图。
+`Identity` is reshaped to `[21, 3]`. The `x, y` values are ROI-space
+coordinates and are projected back to source pixels with `HandRoi.inverse`.
 
-## 6. 人工 21 点 GT 数据
+## 6. Manual 21-Point Ground Truth
 
-`data/handlm_datasets/annotations.json` 是 COCO 风格关键点标注：
+`data/handlm_datasets/annotations.json` is a COCO-style keypoint annotation set:
 
 ```json
 {
-  "images": [
-    {"id": 1, "file_name": "hand_1_0.jpg", "width": 224, "height": 224}
-  ],
+  "images": [...],
   "annotations": [
     {
       "image_id": 1,
-      "keypoints": [x0, y0, v0, ..., x20, y20, v20],
-      "num_keypoints": 21,
-      "bbox": [0, 0, 224, 224],
-      "handedness": "Left"
+      "bbox": [x, y, w, h],
+      "keypoints": [x0, y0, v0, ...]
     }
   ]
 }
 ```
 
-关键点顺序与 MediaPipe 21 点一致：
+The keypoint order matches MediaPipe's 21-point hand topology:
 
 ```text
-wrist,
-thumb_cmc, thumb_mcp, thumb_ip, thumb_tip,
-index_mcp, index_pip, index_dip, index_tip,
-middle_mcp, middle_pip, middle_dip, middle_tip,
-ring_mcp, ring_pip, ring_dip, ring_tip,
-pinky_mcp, pinky_pip, pinky_dip, pinky_tip
+0 wrist
+1-4 thumb
+5-8 index
+9-12 middle
+13-16 ring
+17-20 pinky
 ```
 
-当前 baseline 将它视为人工校正 GT，在 `224x224` crop 坐标系内直接评估 landmark 模型。这个评估不经过 palm detector，因此用于衡量 landmark 模型本身的精度和速度。
+This dataset is treated as manually corrected ground truth for evaluating the
+landmark model itself in `224x224` crop coordinates. It bypasses palm detection
+and therefore isolates landmark-model accuracy and speed.

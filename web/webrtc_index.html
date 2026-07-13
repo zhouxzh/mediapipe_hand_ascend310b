@@ -55,8 +55,34 @@
             <input id="modelInput" type="text" value="palm 192x192 + landmark 224x224" readonly>
           </label>
           <label class="field">
+            <span>Pipeline</span>
+            <select id="pipelineMode">
+              <option value="tracking" selected>Tracking</option>
+              <option value="image">Frame detector</option>
+            </select>
+          </label>
+          <label class="field">
             <span>摄像头</span>
             <input id="source" type="text" value="/dev/video0">
+          </label>
+        </div>
+
+        <div class="two-col">
+          <label class="field">
+            <span>Threading</span>
+            <select id="threadingMode">
+              <option value="pipeline" selected>Pipeline</option>
+              <option value="serial">Serial</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Queue</span>
+            <select id="pipelineQueueSize">
+              <option value="1" selected>Latest only</option>
+              <option value="2">2 frames</option>
+              <option value="4">4 frames</option>
+              <option value="8">8 frames</option>
+            </select>
           </label>
         </div>
 
@@ -105,8 +131,8 @@
           <label class="field">
             <span>采集后端</span>
             <select id="cameraBackend">
-              <option value="opencv" selected>OpenCV</option>
-              <option value="dvpp">DVPP JPEGD</option>
+              <option value="opencv">OpenCV</option>
+              <option value="dvpp" selected>DVPP JPEGD</option>
             </select>
           </label>
         </div>
@@ -123,8 +149,8 @@
           <label class="field">
             <span>编码器</span>
             <select id="encoderMode">
-              <option value="cpu" selected>CPU libx264</option>
-              <option value="cann">CANN VENC H.264</option>
+              <option value="cpu">CPU libx264</option>
+              <option value="cann" selected>CANN VENC H.264</option>
             </select>
           </label>
         </div>

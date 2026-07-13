@@ -2,6 +2,9 @@ const elements = {
   detector: document.querySelector("#detector"),
   landmark: document.querySelector("#landmark"),
   modelInput: document.querySelector("#modelInput"),
+  pipelineMode: document.querySelector("#pipelineMode"),
+  threadingMode: document.querySelector("#threadingMode"),
+  pipelineQueueSize: document.querySelector("#pipelineQueueSize"),
   source: document.querySelector("#source"),
   resolution: document.querySelector("#resolution"),
   fps: document.querySelector("#fps"),
@@ -137,6 +140,19 @@ async function checkHealth() {
   if (data.defaults?.encoder_mode) {
     setSelectValue(elements.encoderMode, data.defaults.encoder_mode);
   }
+  if (data.defaults?.pipeline_mode) {
+    setSelectValue(elements.pipelineMode, data.defaults.pipeline_mode);
+  }
+  if (data.defaults?.threading_mode) {
+    setSelectValue(elements.threadingMode, data.defaults.threading_mode);
+  }
+  if (data.defaults?.pipeline_queue_size) {
+    setSelectValue(
+      elements.pipelineQueueSize,
+      data.defaults.pipeline_queue_size,
+      Number(data.defaults.pipeline_queue_size) === 1 ? "Latest only" : `${data.defaults.pipeline_queue_size} frames`
+    );
+  }
   setText(elements.pipelineStatus, `${data.defaults?.camera_backend ?? "opencv"} / ${data.encoder ?? "unknown"}`);
   if (data.default_source) {
     elements.source.value = data.default_source;
@@ -178,6 +194,9 @@ function setControlsBusy(isBusy) {
   elements.start.disabled = isBusy;
   elements.detector.disabled = isBusy;
   elements.landmark.disabled = isBusy;
+  elements.pipelineMode.disabled = isBusy;
+  elements.threadingMode.disabled = isBusy;
+  elements.pipelineQueueSize.disabled = isBusy;
   elements.source.disabled = isBusy;
   elements.resolution.disabled = isBusy;
   elements.fps.disabled = isBusy;
@@ -413,17 +432,30 @@ async function readServerStats() {
   const npuMs = formatNumber(data.npu_latency_ms);
   const totalMs = formatNumber(data.infer_total_ms);
   const inferFps = formatNumber(data.infer_fps);
-  setText(elements.inferStatus, `1/${data.infer_every_n ?? "?"} / NPU ${npuMs} ms / total ${totalMs} ms / ${inferFps} fps`);
+  const predictionAgeMs = formatNumber(data.prediction_age_ms);
+  const detPreMs = formatNumber(data.det_pre_ms);
+  const detNpuMs = formatNumber(data.det_npu_ms);
+  const detPostMs = formatNumber(data.det_post_ms);
+  const roiMs = formatNumber(data.roi_ms);
+  const cropMs = formatNumber(data.crop_ms);
+  const landmarkNpuMs = formatNumber(data.landmark_npu_ms);
+  const landmarkPostMs = formatNumber(data.landmark_post_ms);
+  setText(
+    elements.inferStatus,
+    `1/${data.infer_every_n ?? "?"} / NPU ${npuMs} ms / total ${totalMs} ms / ${inferFps} fps / age ${predictionAgeMs} ms / det ${detPreMs}+${detNpuMs}+${detPostMs} / roi ${roiMs}+${cropMs} / lm ${landmarkNpuMs}+${landmarkPostMs}`
+  );
   setText(elements.handStatus, `${data.hands ?? 0}`);
   const captureFps = formatNumber(data.capture_fps);
   const captureMs = formatNumber(data.capture_ms);
   const pipelineMs = formatNumber(data.pipeline_ms);
   const nv12Ms = formatNumber(data.nv12_ms);
+  const latestAgeMs = formatNumber(data.latest_frame_age_ms);
+  const droppedFrames = Number(data.dropped_frames ?? 0);
   const fourcc = data.actual_fourcc || data.camera_fourcc || "?";
   if (!serverErrors) {
     setText(
       elements.pipelineStatus,
-      `${data.camera_backend ?? "?"}/${fourcc} / cap ${captureFps} fps/${captureMs} ms / nv12 ${nv12Ms} ms / frame ${pipelineMs} ms / ${data.encoder ?? elements.encoderMode.value}`
+      `${data.pipeline_mode ?? elements.pipelineMode.value} ${data.threading_mode ?? elements.threadingMode.value} q${data.pipeline_queue_size ?? elements.pipelineQueueSize.value} drop ${droppedFrames} / ${data.camera_backend ?? "?"}/${fourcc} / cap ${captureFps} fps/${captureMs} ms age ${latestAgeMs} ms / nv12 ${nv12Ms} ms / frame ${pipelineMs} ms / ${data.encoder ?? elements.encoderMode.value}`
     );
   }
 }
@@ -483,10 +515,12 @@ function logAppliedSourceSettings(sourceSettings) {
   }
   const applied = sourceSettings.applied;
   const bitrate = applied.bitrate_kbps ? `${applied.bitrate_kbps} kbps` : "auto";
+  const threading = applied.threading_mode ?? sourceSettings.threading_mode ?? "pipeline";
+  const queueSize = applied.pipeline_queue_size ?? sourceSettings.pipeline_queue_size ?? 1;
   log(
-    `服务端 detector=${sourceSettings.detector ?? "unknown"} landmark=${sourceSettings.landmark ?? "unknown"} source=${sourceSettings.source ?? "unknown"} capture=${applied.width ?? "?"}x${applied.height ?? "?"}@${applied.fps ?? "?"} bitrate=${bitrate} backend=${applied.camera_backend ?? "?"} infer=1/${applied.infer_every_n ?? "?"} fourcc=${applied.actual_fourcc || applied.camera_fourcc || "?"}`
+    `服务端 detector=${sourceSettings.detector ?? "unknown"} landmark=${sourceSettings.landmark ?? "unknown"} source=${sourceSettings.source ?? "unknown"} mode=${applied.pipeline_mode ?? sourceSettings.pipeline_mode ?? "tracking"} threading=${threading} queue=${queueSize} capture=${applied.width ?? "?"}x${applied.height ?? "?"}@${applied.fps ?? "?"} bitrate=${bitrate} backend=${applied.camera_backend ?? "?"} infer=1/${applied.infer_every_n ?? "?"} fourcc=${applied.actual_fourcc || applied.camera_fourcc || "?"}`
   );
-  setText(elements.pipelineStatus, `${applied.camera_backend ?? "?"}/${applied.actual_fourcc || applied.camera_fourcc || "?"} / ${sourceSettings.encoder ?? elements.encoderMode.value}`);
+  setText(elements.pipelineStatus, `${applied.pipeline_mode ?? sourceSettings.pipeline_mode ?? "tracking"} ${threading} q${queueSize} / ${applied.camera_backend ?? "?"}/${applied.actual_fourcc || applied.camera_fourcc || "?"} / ${sourceSettings.encoder ?? elements.encoderMode.value}`);
 }
 
 async function startConnection() {
@@ -541,6 +575,9 @@ async function startConnection() {
         encoder_mode: elements.encoderMode.value,
         camera_backend: elements.cameraBackend.value,
         camera_fourcc: elements.cameraFourcc.value,
+        pipeline_mode: elements.pipelineMode.value,
+        threading_mode: elements.threadingMode.value,
+        pipeline_queue_size: positiveInteger(elements.pipelineQueueSize.value, "Pipeline queue"),
         infer_every_n: inferEvery,
         score_threshold: scoreThreshold,
         nms_iou: nmsIou,

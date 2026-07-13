@@ -1,112 +1,142 @@
-# Pipeline 与 MediaPipe Graph
+# Pipeline and MediaPipe Graph
 
-本文件解释 MediaPipe Hand 的完整 pipeline、legacy MediaPipe graph 的关键节点，以及本工程如何把验证拆成可定位误差的层级。
+This document describes the MediaPipe Hands pipeline, the legacy MediaPipe graph
+nodes that matter for this project, and the validation layers used to isolate
+errors during the Ascend 310B port.
 
-## 1. 复刻对象
+## 1. Target Pipeline
 
-MediaPipe Hand 不是单个端到端模型，而是一条两阶段链路：
+MediaPipe Hands is not a single end-to-end model. It is a two-stage pipeline:
 
 ```text
-原图 BGR/RGB
-  -> ImageToTensor 预处理算子
+BGR/RGB input image
+  -> ImageToTensor preprocessing
        - full-image ROI
-       - keep_aspect_ratio padding
-       - warpPerspective 采样到 192x192
+       - keep-aspect-ratio padding
+       - warpPerspective sampling to 192x192
   -> palm detector TFLite
   -> SSD anchor decode
   -> score sigmoid
   -> remove normalized padding
   -> weighted NMS
-  -> palm box + 7 个 palm keypoints
-  -> palm detection to hand rect
-  -> rotated ROI crop, 224x224
+  -> palm box + 7 palm keypoints
+  -> palm detection to rotated hand rect
+  -> rotated ROI crop to 224x224
   -> hand landmark TFLite
-  -> 21 个 landmark + hand score + handedness + world landmarks
-  -> landmark 反投影回原图
+  -> 21 landmarks + hand score + handedness + world landmarks
+  -> project landmarks back to the source image
 ```
 
-迁移到 Ascend 310B 时，真正要移植的是“模型 + 几何后处理 + 验证方法”三件事。只转换 TFLite 模型是不够的。
+The Ascend 310B port must reproduce three things: model inference, geometric
+post-processing, and validation. Converting the TFLite models alone is not
+enough.
 
-## 2. 代码对应关系
+## 2. Code Mapping
 
-| 模块 | 作用 |
+| Module | Role |
 | --- | --- |
-| `hand_pipeline/preprocess.py` | 复刻 `ImageToTensorCalculator` 预处理算子，用连续 ROI `warpPerspective` 生成 detector 输入 tensor，并记录 normalized padding |
-| `hand_pipeline/decode.py` | 生成 2016 个 SSD anchor，解码 raw palm 输出，执行 weighted NMS |
-| `hand_pipeline/roi.py` | 从 palm detection 生成 hand ROI，完成旋转 crop 和 landmark 反投影 |
-| `hand_pipeline/inference.py` | 封装 LiteRT/TFLite interpreter |
-| `hand_pipeline/eval.py` | palm GT 加载、IoU、AP、precision/recall 计算 |
-| `scripts/*.py` | 可直接运行的验证和分析程序 |
+| `hand_pipeline/preprocess.py` | Reproduces `ImageToTensorCalculator` using continuous ROI sampling and normalized padding. |
+| `hand_pipeline/decode.py` | Generates 2016 SSD anchors, decodes raw palm outputs, and runs weighted NMS. |
+| `hand_pipeline/roi.py` | Builds hand ROIs from palm detections, performs rotated crops, and projects landmarks back. |
+| `hand_pipeline/inference.py` | Wraps local TFLite/LiteRT-style model inference. |
+| `hand_pipeline/eval.py` | Loads palm ground truth and computes IoU, AP, precision, and recall. |
+| `hand_pipeline/tracking.py` | Implements MediaPipe-style ROI reuse for video tracking. |
+| `scripts/*.py` | Runnable validation, annotation, conversion, and benchmark tools. |
 
-`hand_pipeline/` 是可复用核心库。`scripts/` 是工程工具入口，不再放在库包内部，便于后续移植到 310B 或接入 `webrtc/`。
+`hand_pipeline/` is the reusable core library. `scripts/` contains runnable
+engineering tools and is kept outside the library package so the same logic can
+be used on PC, ace2, and Ascend boards.
 
-## 3. Legacy Graph 的关键节点
+## 3. Legacy Graph Reference
 
-legacy `mediapipe==0.10.14` 中仍可以运行：
+The legacy `mediapipe==0.10.14` graph can still run:
 
 ```text
 mediapipe/modules/hand_landmark/hand_landmark_tracking_cpu.binarypb
 ```
 
-简化后的 graph 主链路：
+The simplified main graph path is:
 
 ```text
-IMAGE:image
+image
   -> PalmDetectionCpu
+  -> ClipDetectionVectorSizeCalculator
+  -> ImagePropertiesCalculator
+  -> BeginLoopDetectionCalculator
   -> PalmDetectionDetectionToRoi
-  -> AssociationNormRectCalculator
+  -> RectTransformationCalculator
   -> HandLandmarkCpu
-  -> HandLandmarkLandmarksToRoi
-  -> PreviousLoopbackCalculator
+  -> EndLoop... calculators
+  -> multi_hand_landmarks / handedness / world_landmarks
 ```
 
-关键节点对应关系：
+Key graph-node mapping:
 
-| MediaPipe 节点 | 作用 | 本工程对应实现 |
+| MediaPipe node | Role | Local implementation |
 | --- | --- | --- |
-| `PalmDetectionCpu` | 整图 palm detector，包括 image-to-tensor、TFLite、decode、NMS | `preprocess.py`、`decode.py`、`scripts/eval_palm_tflite.py` |
-| `ImageToTensorCalculator` | `PalmDetectionCpu` 子图内部预处理算子：把整图按连续 ROI 采样成 `192x192` detector tensor，同时产生 padding 信息 | `preprocess.image_to_tensor()` |
-| `PalmDetectionDetectionToRoi` | 根据 palm box 和 palm keypoints 生成旋转 hand rect | `roi.make_hand_roi()` |
-| `RectTransformationCalculator` | 对 rect 做 shift、scale、square_long 等变换 | `roi.make_hand_roi()` |
-| `HandLandmarkCpu` | 在单手 ROI 内运行 landmark 模型 | `scripts/eval_two_stage_tflite.py` |
-| `HandLandmarkLandmarksToRoi` | 根据上一帧 landmark 生成 tracking ROI | 当前静态图验证关闭 tracking |
+| `PalmDetectionCpu` | Full-image palm detector subgraph, including image-to-tensor, TFLite, decode, and NMS. | `preprocess.py`, `decode.py`, `scripts/eval_palm_tflite.py` |
+| `ImageToTensorCalculator` | Samples the detector tensor from a continuous full-image ROI and produces normalized padding. | `preprocess.image_to_tensor()` |
+| `PalmDetectionDetectionToRoi` | Converts palm boxes and palm keypoints into rotated hand rects. | `roi.normalized_rect_from_palm_detection()` |
+| `RectTransformationCalculator` | Applies shift, scale, and square-long transformations to rects. | `roi.transform_normalized_rect()` |
+| `HandLandmarkCpu` | Runs the landmark model inside a single-hand ROI. | `hand_pipeline.two_stage` |
+| `LandmarkProjectionCalculator` | Projects ROI-space landmarks back to image coordinates. | `roi.project_landmarks_with_normalized_rect()` |
+| `HandLandmarkLandmarksToRoi` | Builds the next tracking ROI from previous landmarks. | `tracking.HandTracker`, `roi.landmarks_to_tracking_roi()` |
 
-## 4. 当前验证分层
+Video and WebRTC use the tracking graph by default. Independent dataset image
+evaluation uses image mode to avoid carrying ROI state across unrelated samples.
 
-官方 Tasks API 通常只暴露最终 21 点、handedness 和部分 box 信息，不暴露 `palm_detections`、`hand_rects_from_palm_detections`、`letterbox_padding` 等中间流。因此本工程把 baseline 拆成多个层级：
+## 4. Validation Layers
 
-| 输出目录 | 验证目标 | 最新结果摘要 |
+The official Tasks API generally exposes final 21 landmarks, handedness, and
+limited hand-level outputs. It does not expose `palm_detections`,
+`hand_rects_from_palm_detections`, or `letterbox_padding`. This project keeps
+separate validation layers so errors can be localized.
+
+| Output area | Validation goal | Current summary |
 | --- | --- | --- |
-| `palm_detector/` | 人工校验 palm box/7 点上的 detector 精度 | precision `0.967102`，recall `0.972361` |
-| `handlm_manual_gt/` | 人工校正 21 点 GT 上的 landmark 模型精度 | full mean `5.940073 px`，lite mean `6.602299 px` |
-| `legacy_graph/` | 运行 legacy graph 并导出中间 rect | legacy graph 可作为 calculator 参考 |
-| `legacy_rect_landmark/` | 使用 legacy 官方 rect 验证 landmark 子链路 | mean `0.016921 px`，接近 0 |
-| `two_stage_vs_legacy_graph/` | 验证完整 palm-to-rect-to-landmark 复刻链路 | mean `0.024968 px` |
-| `two_stage_vs_current_tasks/` | 对齐当前 Tasks 参考输出 | mean `3.630226 px` |
+| `palm_detector/` | Validate detector accuracy on manually checked palm boxes and 7 keypoints. | precision `0.967102`, recall `0.972361` |
+| `handlm_manual_gt/` | Validate the landmark model on manually corrected 21-point crops. | full mean `5.940073 px`, lite mean `6.602299 px` |
+| `legacy_graph/` | Export legacy graph intermediate rects. | Legacy graph is used as calculator reference. |
+| `legacy_rect_landmark/` | Validate the landmark subpath using official legacy rects. | mean `0.016921 px` |
+| `two_stage_vs_legacy_graph/` | Validate full palm-to-rect-to-landmark reproduction. | mean `0.024968 px` |
+| `two_stage_vs_current_tasks/` | Compare against current Tasks outputs. | mean `3.630226 px` |
 
-这套分层有一个重要判断：
+The important diagnostic pattern is:
 
 ```text
-legacy_rect_landmark 接近 0
-  -> landmark TFLite + ROI crop + 反投影基本正确
-two_stage_vs_legacy_graph 也接近 0
-  -> detector 输入采样、palm decode、NMS、hand rect 和 projection 已经基本对齐 legacy graph
+legacy_rect_landmark ~= 0
+  -> landmark TFLite, ROI crop, and projection are aligned
+two_stage_vs_legacy_graph ~= 0
+  -> detector tensor sampling, palm decode, NMS, hand rects, and projection
+     are aligned with the legacy graph
 ```
 
-其中 `ImageToTensorCalculator` 必须单独作为一个算子看待。旧版 MediaPipe CPU graph 不是简单地先 `resize` 再 `copyMakeBorder`，而是先构造带 padding 的 full-image ROI，再通过 `warpPerspective` 直接采样到 detector 输入 tensor。这个差异会改变 palm detector 的 raw output，进而影响 palm box、7 个 palm keypoints、hand rect 和最终 21 点。
+`ImageToTensorCalculator` must be treated as its own operator. The legacy CPU
+graph does not simply resize and copy-border the input. It builds a padded
+full-image ROI and samples directly into the detector tensor. A mismatch here
+changes raw palm outputs and propagates into boxes, 7 palm keypoints, hand
+rects, and final 21 landmarks.
 
-## 5. 面向 310B 的拆分原则
+## 5. Ascend 310B Porting Principle
 
-310B 移植时建议保持同样的层级边界：
+Keep the same validation boundaries on the board:
 
 ```text
-ImageToTensor preprocess
-detector OM
-decode + NMS
-hand rect
-ROI crop
-landmark OM
-projection
+camera/video frame
+  -> detector input tensor
+  -> palm detector OM raw outputs
+  -> palm decode and NMS
+  -> hand ROI
+  -> landmark input tensor
+  -> landmark OM raw outputs
+  -> projected 21 landmarks
+  -> tracking ROI state
 ```
 
-每层都保存中间数据，与 PC Python 参考链路逐项比较。第一层必须保存 detector input tensor 和 normalized padding；如果这一层和 PC 参考不一致，后面的 palm decode 和 ROI 即使公式正确，也会出现像素级误差。这样比直接看最终 21 点更容易定位误差，也更适合后续接入视频流、WebRTC 和板端推理调度。
+Save intermediate data at each layer and compare it against the PC reference
+path. The detector input tensor and normalized padding must be captured first;
+if they differ, later decode and ROI formulas can be correct while final
+landmarks still diverge.
+
+Detailed tracking behavior is documented in
+[06_tracking_algorithm.md](06_tracking_algorithm.md).

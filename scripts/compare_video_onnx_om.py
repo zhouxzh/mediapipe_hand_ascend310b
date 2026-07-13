@@ -33,7 +33,7 @@ DEFAULT_OM_LANDMARK = "models/om/mediapipe_legacy_0_10_14_hand_landmark_full.om"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--video", default="video/test.mp4")
+    parser.add_argument("--video", default="data/eval_videos/test.mp4")
     parser.add_argument("--onnx-detector", default=DEFAULT_ONNX_DETECTOR)
     parser.add_argument("--onnx-landmark", default=DEFAULT_ONNX_LANDMARK)
     parser.add_argument("--om-detector", default=DEFAULT_OM_DETECTOR)
@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--roi-scale", type=float, default=2.6)
     parser.add_argument("--shift-y", type=float, default=-0.5)
     parser.add_argument("--rotation-offset-degrees", type=float, default=0.0)
+    parser.add_argument("--pipeline-mode", choices=["tracking", "image"], default="tracking")
     parser.add_argument("--match-iou", type=float, default=0.1)
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--frame-stride", type=int, default=1)
@@ -270,6 +271,7 @@ def main() -> int:
         roi_scale=args.roi_scale,
         shift_y=args.shift_y,
         rotation_offset_degrees=args.rotation_offset_degrees,
+        mode=args.pipeline_mode,
     )
     om_pipeline = OmHandPipeline(
         om_detector,
@@ -284,6 +286,7 @@ def main() -> int:
         shift_y=args.shift_y,
         rotation_offset_degrees=args.rotation_offset_degrees,
         reload_detector_each_frame=args.reload_detector_each_frame,
+        mode=args.pipeline_mode,
     )
 
     frame_rows: list[dict[str, Any]] = []
@@ -394,6 +397,7 @@ def main() -> int:
         "min_hand_score": args.min_hand_score,
         "match_iou": args.match_iou,
         "reload_detector_each_frame": args.reload_detector_each_frame,
+        "pipeline_mode": args.pipeline_mode,
         "matched_hands": matched_hands,
         "onnx_unmatched_hands": onnx_unmatched_total,
         "om_unmatched_hands": om_unmatched_total,

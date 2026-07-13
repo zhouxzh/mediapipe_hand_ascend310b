@@ -37,14 +37,41 @@ def _point_xy(point: Any) -> tuple[int, int]:
     return int(round(float(arr[0]))), int(round(float(arr[1])))
 
 
+def mirror_predictions_horizontal(predictions: list[dict[str, Any]], image_width: int) -> list[dict[str, Any]]:
+    """Return display-only predictions mirrored across the image width."""
+    mirrored: list[dict[str, Any]] = []
+    width = float(image_width)
+    point_width = max(width - 1.0, 0.0)
+    for pred in predictions:
+        item = dict(pred)
+        if item.get("box") is not None:
+            box = np.asarray(item["box"], dtype=np.float32).copy()
+            if box.shape[0] >= 4:
+                x1 = float(box[0])
+                x2 = float(box[2])
+                box[0] = width - x2
+                box[2] = width - x1
+                item["box"] = box.astype(float).tolist()
+        for key in ("palm7", "hand21"):
+            if item.get(key) is None:
+                continue
+            points = np.asarray(item[key], dtype=np.float32).copy()
+            if points.ndim >= 2 and points.shape[-1] >= 2:
+                points[..., 0] = point_width - points[..., 0]
+                item[key] = points.astype(float).tolist()
+        mirrored.append(item)
+    return mirrored
+
+
 def draw_hand_predictions(
     image_bgr: np.ndarray,
     predictions: list[dict[str, Any]],
     *,
     show_palm: bool = True,
     show_landmarks: bool = True,
+    copy_image: bool = True,
 ) -> np.ndarray:
-    canvas = image_bgr.copy()
+    canvas = image_bgr.copy() if copy_image else image_bgr
     for index, pred in enumerate(predictions):
         color = (32, 210, 120) if index == 0 else (255, 170, 40)
         palm_color = (60, 180, 255)

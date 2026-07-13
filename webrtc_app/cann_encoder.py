@@ -455,11 +455,8 @@ class CannVenc:
         self._running = True
 
         # Callback synchronization
-        self._cb_event = threading.Event()
-        self._cb_lock = threading.Lock()
-        self._encoded_data: Optional[bytes] = None
-        self._encoded_size: int = 0
-        self._cb_error: int = 0
+        self._encode_lock = threading.Lock()
+        self._active_callback_done: Optional[threading.Event] = None
         self._cb_queue: queue.Queue = queue.Queue(maxsize=64)
 
         # Input alignment (CANN VENC requires 16-aligned width for NV12)
@@ -482,6 +479,7 @@ class CannVenc:
 
     def _venc_callback(self, input_pic_desc, output_stream_desc, _user_data):
         """Called by CANN when a frame is encoded."""
+        encoded: Optional[bytes] = None
         try:
             size = _acl_media.dvpp_get_stream_desc_size(output_stream_desc)
             if size > 0:
@@ -489,26 +487,32 @@ class CannVenc:
                 # Copy encoded data from DVPP memory to host
                 host_buf, ret = _acl_rt.malloc_host(size)
                 if ret == ACL_SUCCESS:
-                    _acl_rt.memcpy(host_buf, size, data_ptr, size,
-                                   ACL_MEMCPY_DEVICE_TO_HOST)
-                    encoded = ctypes_copy_bytes(host_buf, size)
-                    _acl_rt.free_host(host_buf)
-                    self._cb_queue.put(encoded)
-                else:
-                    self._cb_queue.put(None)
-            else:
-                self._cb_queue.put(None)
+                    try:
+                        _check_acl_call(
+                            "acl.rt.memcpy(VENC output)",
+                            _acl_rt.memcpy(
+                                host_buf,
+                                size,
+                                data_ptr,
+                                size,
+                                ACL_MEMCPY_DEVICE_TO_HOST,
+                            ),
+                        )
+                        encoded = ctypes_copy_bytes(host_buf, size)
+                    finally:
+                        _acl_rt.free_host(host_buf)
         except Exception as exc:
             logger.error("VENC callback error: %s", exc)
-            try:
-                self._cb_queue.put(None)
-            except Exception:
-                pass
         finally:
-            # CANN owns the output stream desc. The caller frees the input DVPP
-            # buffer after the callback has been consumed.
             if input_pic_desc is not None:
                 _acl_media.dvpp_destroy_pic_desc(input_pic_desc)
+            callback_done = self._active_callback_done
+            if callback_done is not None:
+                callback_done.set()
+            try:
+                self._cb_queue.put_nowait(encoded)
+            except queue.Full:
+                logger.error("VENC callback queue is full; dropping encoded frame")
 
     def _create_channel(self):
         self._channel_desc = _acl_media.venc_create_channel_desc()
@@ -576,10 +580,27 @@ class CannVenc:
             force_keyframe: Force this frame to be an I-frame.
             pre_padded: If True, nv12_data is already stride-aligned (from JPEGD).
         """
+        with self._encode_lock:
+            return self._encode_frame(nv12_data, force_keyframe, pre_padded)
+
+    def _release_frame_resources(
+        self,
+        input_buffer,
+        out_buffer,
+        stream_desc,
+        pic_desc=None,
+    ) -> None:
+        if pic_desc is not None:
+            _acl_media.dvpp_destroy_pic_desc(pic_desc)
+        _acl_media.dvpp_free(input_buffer)
+        _acl_media.dvpp_free(out_buffer)
+        _acl_media.dvpp_destroy_stream_desc(stream_desc)
+
+    def _encode_frame(self, nv12_data: np.ndarray, force_keyframe: bool, pre_padded: bool) -> bytes:
         if not self._running:
             raise RuntimeError("VENC channel is closed")
 
-        _acl_rt.set_context(self._ctx)
+        _check_acl_call("acl.rt.set_context", _acl_rt.set_context(self._ctx))
 
         h = self.height
         w = self.width
@@ -651,31 +672,34 @@ class CannVenc:
         if drained:
             logger.warning("VENC callback queue drained %d leftover frame(s)", drained)
 
+        callback_done = threading.Event()
+        self._active_callback_done = callback_done
         ret = _acl_media.venc_send_frame(self._channel_desc, pic_desc,
                                           stream_desc, self._frame_config, None)
         if ret != ACL_SUCCESS:
-            _acl_media.dvpp_free(input_buffer)
-            _acl_media.dvpp_free(out_buffer)
-            _acl_media.dvpp_destroy_pic_desc(pic_desc)
-            _acl_media.dvpp_destroy_stream_desc(stream_desc)
+            self._active_callback_done = None
+            self._release_frame_resources(input_buffer, out_buffer, stream_desc, pic_desc=pic_desc)
             raise RuntimeError(f"venc_send_frame failed: {ret}")
 
         try:
             encoded = self._cb_queue.get(timeout=5.0)
-        except queue.Empty:
-            encoded = None
+        except queue.Empty as exc:
+            logger.error("VENC callback timed out; destroying the channel before releasing frame buffers")
+            self.destroy()
+            if not callback_done.is_set():
+                _acl_media.dvpp_destroy_pic_desc(pic_desc)
+            self._release_frame_resources(input_buffer, out_buffer, stream_desc)
+            self._active_callback_done = None
+            raise RuntimeError("VENC callback timed out after 5 seconds") from exc
 
         if encoded is None:
             logger.debug("VENC produced no output for this frame (encoder buffering)")
             encoded = b""
 
-        # Cleanup
-        _acl_media.dvpp_free(input_buffer)
-        _acl_media.dvpp_free(out_buffer)
-        _acl_media.dvpp_destroy_stream_desc(stream_desc)
-        # pic_desc is destroyed in callback
+        self._active_callback_done = None
+        self._release_frame_resources(input_buffer, out_buffer, stream_desc)
 
-        if force_keyframe:
+        if force_keyframe and self._frame_config is not None:
             _acl_media.venc_set_frame_config_force_i_frame(self._frame_config, False)
 
         return encoded or b""

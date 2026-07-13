@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import faulthandler
 import fractions
 import logging
 import math
@@ -16,13 +17,126 @@ import time
 import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from textwrap import dedent
 from typing import Any
+
+
+def _prepend_user_ssl_fix_path() -> None:
+    """Use the local OpenSSL repair copy before importing Python's ssl module."""
+    fix_dir = _user_ssl_fix_path()
+    if fix_dir is None:
+        return
+    fix_text = str(fix_dir)
+    if fix_text not in sys.path:
+        sys.path.insert(0, fix_text)
+    pythonpath = os.environ.get("PYTHONPATH", "")
+    parts = [part for part in pythonpath.split(os.pathsep) if part]
+    if fix_text not in parts:
+        os.environ["PYTHONPATH"] = os.pathsep.join([fix_text, *parts])
+
+
+def _remove_user_ssl_fix_path() -> None:
+    """Prefer the active conda env's ssl module when it works."""
+    fix_dir = _user_ssl_fix_path()
+    if fix_dir is None:
+        return
+    fix_text = str(fix_dir)
+    sys.path[:] = [part for part in sys.path if part != fix_text]
+    pythonpath = os.environ.get("PYTHONPATH", "")
+    parts = [part for part in pythonpath.split(os.pathsep) if part and part != fix_text]
+    if parts:
+        os.environ["PYTHONPATH"] = os.pathsep.join(parts)
+    else:
+        os.environ.pop("PYTHONPATH", None)
+
+
+def _user_ssl_fix_path() -> Path | None:
+    """Return the optional user-side _ssl repair path when present."""
+    fix_dir = (
+        Path.home()
+        / ".local"
+        / "mediapipe_hand_ssl_fix"
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "lib-dynload"
+    )
+    if not fix_dir.exists():
+        return None
+    return fix_dir
+
+
+def _ensure_user_pycache_prefix() -> None:
+    """Avoid stale or incompatible root-owned pyc files in the board base env."""
+    if getattr(sys, "pycache_prefix", None):
+        return
+    pycache_prefix = Path.home() / ".cache" / "mediapipe_hand_pycache"
+    try:
+        pycache_prefix.mkdir(parents=True, exist_ok=True)
+        sys.pycache_prefix = str(pycache_prefix)
+        os.environ.setdefault("PYTHONPYCACHEPREFIX", str(pycache_prefix))
+    except OSError:
+        pass
+
+
+def _verify_python_ssl_runtime() -> None:
+    """Fail early when conda's OpenSSL runtime is broken."""
+    _remove_user_ssl_fix_path()
+    try:
+        import ssl  # noqa: F401
+        return
+    except ImportError as first_exc:
+        sys.modules.pop("ssl", None)
+        sys.modules.pop("_ssl", None)
+        _prepend_user_ssl_fix_path()
+    try:
+        import ssl  # noqa: F401
+        return
+    except ImportError as exc:
+        prefix = Path(sys.prefix)
+        cached_openssl = prefix / "pkgs" / "openssl-1.1.1w-h2f4d8fa_0" / "lib"
+        repair_hint = ""
+        if cached_openssl.exists():
+            repair_hint = dedent(f"""
+
+This board has a cached OpenSSL package that can be used to repair the base env:
+
+sudo cp -a {prefix}/lib/libcrypto.so.1.1 {prefix}/lib/libcrypto.so.1.1.bak.$(date +%Y%m%d_%H%M%S)
+sudo cp -a {prefix}/lib/libssl.so.1.1 {prefix}/lib/libssl.so.1.1.bak.$(date +%Y%m%d_%H%M%S)
+sudo cp -a {cached_openssl}/libcrypto.so.1.1 {prefix}/lib/libcrypto.so.1.1
+sudo cp -a {cached_openssl}/libssl.so.1.1 {prefix}/lib/libssl.so.1.1
+""")
+        message = dedent(f"""
+Python ssl runtime is broken before aiortc is imported.
+
+Python: {sys.executable}
+Prefix: {prefix}
+Original error: {first_exc}
+Repair-path retry error: {exc}
+
+WebRTC requires Python's ssl module through aioice/aiortc. Fix the conda
+OpenSSL runtime first, then verify with:
+
+python - <<'PY'
+import ssl
+print(ssl.OPENSSL_VERSION)
+import aiortc
+print(aiortc.__version__)
+PY
+{repair_hint}""").strip()
+        raise SystemExit(message) from exc
+
+
+faulthandler.enable(all_threads=True)
+_ensure_user_pycache_prefix()
+_verify_python_ssl_runtime()
 
 import av
 import cv2
 import numpy as np
 from aiohttp import web
 from aiortc import MediaStreamTrack
+from aiortc import RTCConfiguration
+from aiortc import RTCIceServer
 from aiortc import RTCPeerConnection
 from aiortc import RTCRtpSender
 from aiortc import RTCSessionDescription
@@ -33,17 +147,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from hand_pipeline.decode import decode_raw_palm
-from hand_pipeline.decode import generate_palm_anchors
-from hand_pipeline.decode import weighted_nms
-from hand_pipeline.om_runtime import PersistentAclModel
-from hand_pipeline.om_runtime import PersistentAclRuntime
-from hand_pipeline.preprocess import image_to_tensor
-from hand_pipeline.roi import landmarks_to_original
-from hand_pipeline.roi import make_hand_roi
-from hand_pipeline.roi import preprocess_landmark_tflite
+from hand_pipeline.two_stage import OmHandPipeline
+from hand_pipeline.realtime_graph import MediaPipeHandRealtimeGraph
+from hand_pipeline.realtime_graph import RealtimeFramePacket
+from hand_pipeline.visualization import HAND_EDGES
+from hand_pipeline.visualization import _point_xy
 from hand_pipeline.visualization import draw_hand_predictions
 from hand_pipeline.visualization import draw_status_overlay
+from hand_pipeline.visualization import mirror_predictions_horizontal
 
 try:
     from webrtc_app.cann_encoder import (
@@ -55,20 +166,36 @@ try:
         set_session_encoder_mode,
         set_session_bitrate_override_kbps,
     )
-    from webrtc_app.dvpp_jpegd import DvppJpegDecoder
-    from webrtc_app.v4l2_capture import V4l2MjpegCapture
-    from webrtc_app.v4l2_raw import V4l2RawCapture
-except ImportError:
+    _cann_import_error: Exception | None = None
+except Exception as exc:
     CannH264Encoder = None  # type: ignore[assignment]
     probe_cann_venc = None  # type: ignore[assignment]
-    DvppJpegDecoder = None  # type: ignore[assignment]
-    V4l2MjpegCapture = None  # type: ignore[assignment]
-    V4l2RawCapture = None  # type: ignore[assignment]
     _try_import_cann = None  # type: ignore[assignment]
     collect_venc_diagnostics = None  # type: ignore[assignment]
     set_encoder_status_callback = None  # type: ignore[assignment]
     set_session_encoder_mode = None  # type: ignore[assignment]
     set_session_bitrate_override_kbps = None  # type: ignore[assignment]
+    _cann_import_error = exc
+
+DvppJpegDecoder = None  # type: ignore[assignment]
+V4l2RawCapture = None  # type: ignore[assignment]
+_dvpp_import_error: Exception | None = None
+
+
+def load_dvpp_camera_modules() -> None:
+    """Import optional DVPP camera helpers only when that backend is requested."""
+    global DvppJpegDecoder, V4l2RawCapture, _dvpp_import_error
+    if DvppJpegDecoder is not None and V4l2RawCapture is not None:
+        return
+    try:
+        from webrtc_app.dvpp_jpegd import DvppJpegDecoder as _DvppJpegDecoder
+        from webrtc_app.v4l2_raw import V4l2RawCapture as _V4l2RawCapture
+    except Exception as exc:
+        _dvpp_import_error = exc
+        raise RuntimeError(f"DVPP camera modules are unavailable: {exc}") from exc
+    DvppJpegDecoder = _DvppJpegDecoder
+    V4l2RawCapture = _V4l2RawCapture
+    _dvpp_import_error = None
 
 
 WEB_DIR = ROOT / "web"
@@ -79,8 +206,16 @@ DEFAULT_LANDMARK = "mediapipe_legacy_0_10_14_hand_landmark_full.om"
 DEFAULT_H264_BITRATE_KBPS = 4000
 DEFAULT_INFER_EVERY_N = 1
 DEFAULT_CANN_VENC_RETRY_SECONDS = 300
+DEFAULT_ICE_SERVERS = ""
 CAMERA_BACKEND_OPENCV = "opencv"
 CAMERA_BACKEND_DVPP = "dvpp"
+DEFAULT_CAMERA_BACKEND = CAMERA_BACKEND_DVPP
+DEFAULT_ENCODER_MODE = "cann"
+THREADING_MODE_SERIAL = "serial"
+THREADING_MODE_PIPELINE = "pipeline"
+DEFAULT_THREADING_MODE = THREADING_MODE_PIPELINE
+DEFAULT_PIPELINE_QUEUE_SIZE = 1
+PIPELINE_QUEUE_SIZES = (1, 2, 4, 8)
 VIDEO_CLOCK_RATE = 90000
 VIDEO_TIME_BASE = fractions.Fraction(1, VIDEO_CLOCK_RATE)
 
@@ -98,6 +233,7 @@ encoder_state = {
     "cann_blocked_until": 0.0,
     "cann_blocked_reason": "",
 }
+_NV12_UV_DIRECT_DRAW: bool | None = None
 
 
 def no_store_file_response(path: Path) -> web.FileResponse:
@@ -112,7 +248,8 @@ def patch_h264_encoder() -> bool:
     encoder_state["last_error"] = ""
 
     if CannH264Encoder is None:
-        app_logger.warning("WebRTC H.264 patch encoder is unavailable; using aiortc default H.264 encoder")
+        detail = f": {_cann_import_error}" if _cann_import_error else ""
+        app_logger.warning("WebRTC H.264 patch encoder is unavailable%s; using aiortc default H.264 encoder", detail)
         return False
     import aiortc.codecs as codecs_module
     import aiortc.codecs.h264 as h264_module
@@ -228,6 +365,256 @@ def bgr_to_nv12(bgr: np.ndarray) -> np.ndarray:
     return nv12
 
 
+def flip_nv12_horizontal(nv12: np.ndarray, width: int, height: int) -> np.ndarray:
+    if nv12.ndim != 2:
+        raise ValueError(f"NV12 frame must be 2D, got shape={nv12.shape}")
+    y = nv12[:height, :width][:, ::-1]
+    uv = nv12[height : height + height // 2, :width].reshape(height // 2, width // 2, 2)[:, ::-1, :]
+    flipped = np.empty((height * 3 // 2, width), dtype=np.uint8)
+    flipped[:height, :] = y
+    flipped[height:, :] = uv.reshape(height // 2, width)
+    return flipped
+
+
+def bgr_color_to_yuv(color_bgr: tuple[int, int, int]) -> tuple[int, int, int]:
+    b, g, r = (float(color_bgr[0]), float(color_bgr[1]), float(color_bgr[2]))
+    y = 16.0 + 0.098 * b + 0.504 * g + 0.257 * r
+    u = 128.0 + 0.439 * b - 0.291 * g - 0.148 * r
+    v = 128.0 - 0.071 * b - 0.368 * g + 0.439 * r
+    return tuple(int(np.clip(round(value), 0, 255)) for value in (y, u, v))  # type: ignore[return-value]
+
+
+def _nv12_yuv_planes(nv12: np.ndarray, width: int, height: int) -> tuple[np.ndarray, np.ndarray]:
+    y = nv12[:height, :width]
+    uv = nv12[height : height + height // 2, :width].reshape(height // 2, width // 2, 2)
+    return y, uv
+
+
+def _uv_point(point: tuple[int, int]) -> tuple[int, int]:
+    return int(point[0]) // 2, int(point[1]) // 2
+
+
+def _paint_uv_mask(uv_plane: np.ndarray, mask: np.ndarray, u_value: int, v_value: int) -> None:
+    selected = mask > 0
+    uv_plane[:, :, 0][selected] = u_value
+    uv_plane[:, :, 1][selected] = v_value
+
+
+def _draw_uv_direct(
+    uv_plane: np.ndarray,
+    draw_func: str,
+    args: tuple[Any, ...],
+    color: tuple[int, int],
+    thickness: int,
+    line_type: int | None = None,
+) -> bool:
+    global _NV12_UV_DIRECT_DRAW
+    if _NV12_UV_DIRECT_DRAW is False:
+        return False
+    try:
+        func = getattr(cv2, draw_func)
+        params: list[Any] = [uv_plane, *args, color, thickness]
+        if line_type is None:
+            func(*params)
+        else:
+            func(*params, line_type)
+        _NV12_UV_DIRECT_DRAW = True
+        return True
+    except Exception:
+        _NV12_UV_DIRECT_DRAW = False
+        return False
+
+
+def draw_nv12_line(
+    nv12: np.ndarray,
+    width: int,
+    height: int,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    color_bgr: tuple[int, int, int],
+    thickness: int,
+) -> None:
+    y_plane, uv_plane = _nv12_yuv_planes(nv12, width, height)
+    y_value, u_value, v_value = bgr_color_to_yuv(color_bgr)
+    uv_thickness = max(1, int(math.ceil(thickness / 2.0)))
+    cv2.line(y_plane, start, end, y_value, thickness, cv2.LINE_AA)
+    if _draw_uv_direct(
+        uv_plane,
+        "line",
+        (_uv_point(start), _uv_point(end)),
+        (u_value, v_value),
+        uv_thickness,
+        cv2.LINE_AA,
+    ):
+        return
+    mask = np.zeros(uv_plane.shape[:2], dtype=np.uint8)
+    cv2.line(mask, _uv_point(start), _uv_point(end), 255, uv_thickness, cv2.LINE_AA)
+    _paint_uv_mask(uv_plane, mask, u_value, v_value)
+
+
+def draw_nv12_rectangle(
+    nv12: np.ndarray,
+    width: int,
+    height: int,
+    p1: tuple[int, int],
+    p2: tuple[int, int],
+    color_bgr: tuple[int, int, int],
+    thickness: int,
+) -> None:
+    y_plane, uv_plane = _nv12_yuv_planes(nv12, width, height)
+    y_value, u_value, v_value = bgr_color_to_yuv(color_bgr)
+    uv_thickness = thickness if thickness < 0 else max(1, int(math.ceil(thickness / 2.0)))
+    cv2.rectangle(y_plane, p1, p2, y_value, thickness)
+    if _draw_uv_direct(
+        uv_plane,
+        "rectangle",
+        (_uv_point(p1), _uv_point(p2)),
+        (u_value, v_value),
+        uv_thickness,
+    ):
+        return
+    mask = np.zeros(uv_plane.shape[:2], dtype=np.uint8)
+    cv2.rectangle(mask, _uv_point(p1), _uv_point(p2), 255, uv_thickness)
+    _paint_uv_mask(uv_plane, mask, u_value, v_value)
+
+
+def draw_nv12_circle(
+    nv12: np.ndarray,
+    width: int,
+    height: int,
+    center: tuple[int, int],
+    radius: int,
+    color_bgr: tuple[int, int, int],
+    thickness: int,
+) -> None:
+    y_plane, uv_plane = _nv12_yuv_planes(nv12, width, height)
+    y_value, u_value, v_value = bgr_color_to_yuv(color_bgr)
+    uv_radius = max(1, int(math.ceil(radius / 2.0)))
+    uv_thickness = thickness if thickness < 0 else max(1, int(math.ceil(thickness / 2.0)))
+    cv2.circle(y_plane, center, radius, y_value, thickness, cv2.LINE_AA)
+    if _draw_uv_direct(
+        uv_plane,
+        "circle",
+        (_uv_point(center), uv_radius),
+        (u_value, v_value),
+        uv_thickness,
+        cv2.LINE_AA,
+    ):
+        return
+    mask = np.zeros(uv_plane.shape[:2], dtype=np.uint8)
+    cv2.circle(mask, _uv_point(center), uv_radius, 255, uv_thickness, cv2.LINE_AA)
+    _paint_uv_mask(uv_plane, mask, u_value, v_value)
+
+
+def draw_nv12_text(
+    nv12: np.ndarray,
+    width: int,
+    height: int,
+    text: str,
+    origin: tuple[int, int],
+    font_scale: float,
+    color_bgr: tuple[int, int, int],
+    thickness: int,
+) -> None:
+    y_plane, uv_plane = _nv12_yuv_planes(nv12, width, height)
+    y_value, u_value, v_value = bgr_color_to_yuv(color_bgr)
+    uv_origin = _uv_point(origin)
+    uv_scale = max(0.1, font_scale * 0.5)
+    uv_thickness = max(1, int(math.ceil(thickness / 2.0)))
+    cv2.putText(y_plane, text, origin, cv2.FONT_HERSHEY_SIMPLEX, font_scale, y_value, thickness, cv2.LINE_AA)
+    global _NV12_UV_DIRECT_DRAW
+    if _NV12_UV_DIRECT_DRAW is not False:
+        try:
+            cv2.putText(
+                uv_plane,
+                text,
+                uv_origin,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                uv_scale,
+                (u_value, v_value),
+                uv_thickness,
+                cv2.LINE_AA,
+            )
+            _NV12_UV_DIRECT_DRAW = True
+            return
+        except Exception:
+            _NV12_UV_DIRECT_DRAW = False
+    mask = np.zeros(uv_plane.shape[:2], dtype=np.uint8)
+    cv2.putText(mask, text, uv_origin, cv2.FONT_HERSHEY_SIMPLEX, uv_scale, 255, uv_thickness, cv2.LINE_AA)
+    _paint_uv_mask(uv_plane, mask, u_value, v_value)
+
+
+def draw_nv12_hand_predictions(
+    nv12: np.ndarray,
+    width: int,
+    height: int,
+    predictions: list[dict[str, Any]],
+) -> None:
+    for index, pred in enumerate(predictions):
+        color = (32, 210, 120) if index == 0 else (255, 170, 40)
+        palm_color = (60, 180, 255)
+        if pred.get("box") is not None:
+            box = np.asarray(pred["box"], dtype=np.float32)
+            x1, y1, x2, y2 = [int(round(float(v))) for v in box]
+            draw_nv12_rectangle(nv12, width, height, (x1, y1), (x2, y2), palm_color, 2)
+            if pred.get("palm7") is not None:
+                for point in np.asarray(pred["palm7"], dtype=np.float32):
+                    draw_nv12_circle(nv12, width, height, _point_xy(point), 3, palm_color, -1)
+
+        if pred.get("hand21") is not None:
+            points = np.asarray(pred["hand21"], dtype=np.float32)
+            for a, b in HAND_EDGES:
+                draw_nv12_line(nv12, width, height, _point_xy(points[a]), _point_xy(points[b]), color, 2)
+            for point in points:
+                xy = _point_xy(point)
+                draw_nv12_circle(nv12, width, height, xy, 3, (245, 245, 245), -1)
+                draw_nv12_circle(nv12, width, height, xy, 3, color, 1)
+
+        label = f"hand {index + 1}"
+        score = pred.get("score")
+        hand_score = pred.get("hand_score")
+        if isinstance(score, (float, int)):
+            label += f" palm={float(score):.2f}"
+        if isinstance(hand_score, (float, int)) and np.isfinite(hand_score):
+            label += f" lm={float(hand_score):.2f}"
+        origin = _point_xy(np.asarray(pred.get("box", [12, 30, 0, 0]), dtype=np.float32)[:2])
+        draw_nv12_text(nv12, width, height, label, (max(origin[0], 8), max(origin[1] - 8, 22)), 0.55, color, 2)
+
+
+def draw_nv12_status_overlay(
+    nv12: np.ndarray,
+    width: int,
+    height: int,
+    *,
+    capture_fps: float = 0.0,
+    infer_fps: float = 0.0,
+    infer_ms: float = 0.0,
+    hands: int = 0,
+    backend: str = "",
+) -> None:
+    lines = [
+        f"hands {hands}",
+        f"infer {infer_ms:.1f} ms / {infer_fps:.1f} fps",
+        f"capture {capture_fps:.1f} fps",
+    ]
+    if backend:
+        lines.append(backend)
+    x, y = 12, 24
+    for line in lines:
+        (text_width, text_height), _baseline = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.56, 2)
+        draw_nv12_rectangle(
+            nv12,
+            width,
+            height,
+            (x - 5, y - text_height - 6),
+            (x + text_width + 5, y + 6),
+            (18, 24, 32),
+            -1,
+        )
+        draw_nv12_text(nv12, width, height, line, (x, y), 0.56, (220, 245, 240), 2)
+        y += 25
+
+
 def decode_fourcc(value: float | int) -> str:
     code = int(value or 0)
     if code <= 0:
@@ -238,25 +625,6 @@ def decode_fourcc(value: float | int) -> str:
         if char.isprintable():
             chars.append(char)
     return "".join(chars)
-
-
-def pick_landmark_outputs(outputs: list[np.ndarray]) -> tuple[np.ndarray, float, float, np.ndarray | None]:
-    landmarks = None
-    world = None
-    one_value: list[np.ndarray] = []
-    for value in outputs:
-        arr = np.asarray(value)
-        if arr.size == 63 and landmarks is None:
-            landmarks = arr.reshape(21, 3)
-        elif arr.size == 63:
-            world = arr.reshape(21, 3)
-        elif arr.size == 1:
-            one_value.append(arr.reshape(-1))
-    if landmarks is None:
-        raise ValueError(f"Could not find 63-value landmark output: {[x.shape for x in outputs]}")
-    hand_score = float(one_value[0][0]) if len(one_value) >= 1 else math.nan
-    handedness = float(one_value[1][0]) if len(one_value) >= 2 else math.nan
-    return landmarks.astype(np.float32), hand_score, handedness, None if world is None else world.astype(np.float32)
 
 
 async def index(_: web.Request) -> web.FileResponse:
@@ -353,10 +721,13 @@ async def health(request: web.Request) -> web.Response:
                 "nms_iou": request.config_dict.get("nms_iou", 0.3),
                 "max_hands": request.config_dict.get("max_hands", 2),
                 "min_hand_score": request.config_dict.get("min_hand_score", 0.5),
+                "pipeline_mode": request.config_dict.get("pipeline_mode", "tracking"),
+                "threading_mode": request.config_dict.get("threading_mode", DEFAULT_THREADING_MODE),
+                "pipeline_queue_size": request.config_dict.get("pipeline_queue_size", DEFAULT_PIPELINE_QUEUE_SIZE),
                 "bitrate_kbps": request.config_dict.get("bitrate_kbps", DEFAULT_H264_BITRATE_KBPS),
-                "encoder_mode": request.config_dict.get("encoder_mode", "cpu"),
+                "encoder_mode": request.config_dict.get("encoder_mode", DEFAULT_ENCODER_MODE),
                 "cann_venc_retry_seconds": request.config_dict.get("cann_venc_retry_seconds", DEFAULT_CANN_VENC_RETRY_SECONDS),
-                "camera_backend": request.config_dict.get("camera_backend", CAMERA_BACKEND_OPENCV),
+                "camera_backend": request.config_dict.get("camera_backend", DEFAULT_CAMERA_BACKEND),
                 "camera_fourcc": request.config_dict.get("camera_fourcc", "MJPG"),
             },
         }
@@ -415,7 +786,21 @@ def parse_float_range(value: object, name: str, default: float, lower: float, up
     return parsed
 
 
-def parse_offer_payload(params: dict[str, object], default_device_id: int = 0) -> dict[str, object]:
+def parse_choice(value: object, name: str, default: str, choices: set[str]) -> str:
+    parsed = str(value or default).lower()
+    if parsed not in choices:
+        allowed = ", ".join(sorted(choices))
+        raise web.HTTPBadRequest(text=f"{name} must be one of: {allowed}.")
+    return parsed
+
+
+def parse_offer_payload(
+    params: dict[str, object],
+    default_device_id: int = 0,
+    default_pipeline_mode: str = "tracking",
+    default_threading_mode: str = DEFAULT_THREADING_MODE,
+    default_pipeline_queue_size: int = DEFAULT_PIPELINE_QUEUE_SIZE,
+) -> dict[str, object]:
     try:
         offer = RTCSessionDescription(sdp=str(params["sdp"]), type=str(params["type"]))
     except KeyError as exc:
@@ -437,15 +822,27 @@ def parse_offer_payload(params: dict[str, object], default_device_id: int = 0) -
     else:
         bitrate_kbps = parse_positive_int(bitrate_kbps, "bitrate_kbps", DEFAULT_H264_BITRATE_KBPS)
 
-    camera_backend = str(params.get("camera_backend") or CAMERA_BACKEND_OPENCV).lower()
+    camera_backend = str(params.get("camera_backend") or DEFAULT_CAMERA_BACKEND).lower()
     if camera_backend not in {CAMERA_BACKEND_OPENCV, CAMERA_BACKEND_DVPP}:
         raise web.HTTPBadRequest(text="camera_backend must be opencv or dvpp.")
     camera_fourcc = str(params.get("camera_fourcc") or "MJPG").upper()
     if camera_fourcc not in {"MJPG", "YUYV", "DEFAULT"}:
         raise web.HTTPBadRequest(text="camera_fourcc must be MJPG, YUYV, or DEFAULT.")
-    encoder_mode = str(params.get("encoder_mode") or "cpu").lower()
-    if encoder_mode not in {"cpu", "cann"}:
-        raise web.HTTPBadRequest(text="encoder_mode must be cpu or cann.")
+    pipeline_mode = parse_choice(params.get("pipeline_mode"), "pipeline_mode", default_pipeline_mode, {"tracking", "image"})
+    threading_mode = parse_choice(
+        params.get("threading_mode"),
+        "threading_mode",
+        default_threading_mode,
+        {THREADING_MODE_SERIAL, THREADING_MODE_PIPELINE},
+    )
+    pipeline_queue_size = parse_positive_int(
+        params.get("pipeline_queue_size"),
+        "pipeline_queue_size",
+        default_pipeline_queue_size,
+    )
+    if pipeline_queue_size not in PIPELINE_QUEUE_SIZES:
+        raise web.HTTPBadRequest(text=f"pipeline_queue_size must be one of: {', '.join(map(str, PIPELINE_QUEUE_SIZES))}.")
+    encoder_mode = parse_choice(params.get("encoder_mode"), "encoder_mode", DEFAULT_ENCODER_MODE, {"cpu", "cann"})
 
     return {
         "offer": offer,
@@ -465,6 +862,9 @@ def parse_offer_payload(params: dict[str, object], default_device_id: int = 0) -
         "device_id": device_id,
         "camera_backend": camera_backend,
         "camera_fourcc": camera_fourcc,
+        "pipeline_mode": pipeline_mode,
+        "threading_mode": threading_mode,
+        "pipeline_queue_size": pipeline_queue_size,
     }
 
 
@@ -477,6 +877,17 @@ def _offer_has_h264(sdp: str) -> bool:
 
 def _local_h264_codecs():
     return [codec for codec in RTCRtpSender.getCapabilities("video").codecs if codec.mimeType.lower() == "video/h264"]
+
+
+def parse_ice_servers(value: str | None) -> list[RTCIceServer]:
+    if not value:
+        return []
+    servers: list[RTCIceServer] = []
+    for item in str(value).split(","):
+        url = item.strip()
+        if url:
+            servers.append(RTCIceServer(urls=url))
+    return servers
 
 
 def _prefer_h264_for_sender(pc: RTCPeerConnection, sender: RTCRtpSender) -> None:
@@ -523,122 +934,6 @@ def set_video_bitrate_in_sdp(sdp: str, bitrate_kbps: int) -> str:
     return "\r\n".join(output) + "\r\n"
 
 
-class HandOmPipeline:
-    def __init__(
-        self,
-        detector_path: Path,
-        landmark_path: Path,
-        *,
-        device_id: int,
-        score_threshold: float,
-        nms_iou: float,
-        max_hands: int,
-        min_hand_score: float,
-        reload_detector_each_call: bool = False,
-    ) -> None:
-        self.detector_path = detector_path
-        self.landmark_path = landmark_path
-        self.device_id = device_id
-        self.score_threshold = score_threshold
-        self.nms_iou = nms_iou
-        self.max_hands = max_hands
-        self.min_hand_score = min_hand_score
-        self.reload_detector_each_call = reload_detector_each_call
-        self.runtime = PersistentAclRuntime(device_id=device_id, finalize_on_release=False)
-        self.detector: PersistentAclModel | None = None
-        self.landmark: PersistentAclModel | None = None
-        self.anchors = generate_palm_anchors()
-        if not self.reload_detector_each_call:
-            self.detector = PersistentAclModel(detector_path, runtime=self.runtime)
-        self.landmark = PersistentAclModel(landmark_path, runtime=self.runtime)
-
-    def close(self) -> None:
-        if self.detector is not None:
-            self.detector.release()
-            self.detector = None
-        if self.landmark is not None:
-            self.landmark.release()
-            self.landmark = None
-        if self.runtime is not None:
-            self.runtime.release()
-
-    def _detector_infer(self, tensor: np.ndarray) -> list[np.ndarray]:
-        if self.reload_detector_each_call:
-            detector = PersistentAclModel(self.detector_path, runtime=self.runtime)
-            try:
-                return detector.infer(tensor)
-            finally:
-                detector.release()
-        if self.detector is None:
-            self.detector = PersistentAclModel(self.detector_path, runtime=self.runtime)
-        return self.detector.infer(tensor)
-
-    def infer(self, image_bgr: np.ndarray) -> tuple[list[dict[str, Any]], dict[str, float]]:
-        total_start = time.perf_counter()
-        pre_start = time.perf_counter()
-        tensor, letterbox = image_to_tensor(image_bgr, input_size=192)
-        preprocess_ms = (time.perf_counter() - pre_start) * 1000.0
-
-        det_start = time.perf_counter()
-        raw_boxes, raw_scores = self._detector_infer(tensor)
-        detector_ms = (time.perf_counter() - det_start) * 1000.0
-
-        decode_start = time.perf_counter()
-        palms = decode_raw_palm(raw_boxes, raw_scores, self.anchors, letterbox, score_threshold=self.score_threshold)
-        palms = weighted_nms(palms, iou_threshold=self.nms_iou, max_detections=max(20, self.max_hands))
-        decode_ms = (time.perf_counter() - decode_start) * 1000.0
-
-        predictions: list[dict[str, Any]] = []
-        landmark_ms = 0.0
-        post_ms = 0.0
-        landmark = self.landmark
-        if landmark is None:
-            raise RuntimeError("Landmark OM model is not loaded")
-
-        for hand_index, palm in enumerate(sorted(palms, key=lambda item: item.score, reverse=True)[: self.max_hands]):
-            roi_start = time.perf_counter()
-            roi = make_hand_roi(image_bgr, palm.box, palm.keypoints)
-            lm_tensor = preprocess_landmark_tflite(roi.crop)
-            roi_ms = (time.perf_counter() - roi_start) * 1000.0
-
-            lm_start = time.perf_counter()
-            lm_outputs = landmark.infer(lm_tensor)
-            landmark_ms += (time.perf_counter() - lm_start) * 1000.0
-
-            post_start = time.perf_counter()
-            lm_crop, hand_score, handedness, _world = pick_landmark_outputs(lm_outputs)
-            if not math.isnan(hand_score) and hand_score < self.min_hand_score:
-                post_ms += (time.perf_counter() - post_start) * 1000.0
-                continue
-            hand21 = landmarks_to_original(lm_crop, roi.inverse, input_size=224, coord_scale="auto")
-            post_ms += (time.perf_counter() - post_start) * 1000.0
-            predictions.append(
-                {
-                    "hand_index": hand_index,
-                    "score": float(palm.score),
-                    "hand_score": float(hand_score),
-                    "handedness": float(handedness),
-                    "box": palm.box.astype(float).tolist(),
-                    "palm7": palm.keypoints.astype(float).tolist(),
-                    "hand21": hand21.astype(float).tolist(),
-                    "roi_center": roi.center.astype(float).tolist(),
-                    "roi_size": float(roi.size),
-                    "roi_rotation_rad": float(roi.rotation),
-                    "roi_ms": roi_ms,
-                }
-            )
-
-        total_ms = (time.perf_counter() - total_start) * 1000.0
-        return predictions, {
-            "preprocess_ms": preprocess_ms,
-            "detector_ms": detector_ms,
-            "decode_ms": decode_ms,
-            "landmark_ms": landmark_ms,
-            "post_ms": post_ms,
-            "total_ms": total_ms,
-        }
-
-
 class HandOmVideoTrack(MediaStreamTrack):
     kind = "video"
 
@@ -656,9 +951,12 @@ class HandOmVideoTrack(MediaStreamTrack):
         min_hand_score: float,
         infer_every_n: int,
         device_id: int,
-        camera_backend: str = CAMERA_BACKEND_OPENCV,
+        camera_backend: str = DEFAULT_CAMERA_BACKEND,
         camera_fourcc: str = "MJPG",
         reload_detector_each_call: bool = False,
+        pipeline_mode: str = "tracking",
+        threading_mode: str = DEFAULT_THREADING_MODE,
+        pipeline_queue_size: int = DEFAULT_PIPELINE_QUEUE_SIZE,
     ) -> None:
         super().__init__()
         self.detector_path = detector_path
@@ -679,7 +977,11 @@ class HandOmVideoTrack(MediaStreamTrack):
         self.camera_backend = camera_backend
         self.camera_fourcc = camera_fourcc
         self.reload_detector_each_call = reload_detector_each_call
-        self.pipeline: HandOmPipeline | None = None
+        self.pipeline_mode = pipeline_mode
+        self.threading_mode = threading_mode
+        self.pipeline_queue_size = max(1, int(pipeline_queue_size))
+        self.pipeline: OmHandPipeline | None = None
+        self.realtime_graph: MediaPipeHandRealtimeGraph | None = None
         self.cap: cv2.VideoCapture | None = None
         self.capture_impl = None
         self.jpegd = None
@@ -690,9 +992,29 @@ class HandOmVideoTrack(MediaStreamTrack):
         self._frame_index = 0
         self._closed = False
         self._state_lock = threading.Lock()
+        self._prediction_lock = threading.Lock()
+        self._frame_condition = threading.Condition()
+        self._pipeline_stop = threading.Event()
+        self._infer_queue: queue.Queue[RealtimeFramePacket] | None = None
+        self._inference_thread: threading.Thread | None = None
+        self._latest_frame_packet: RealtimeFramePacket | None = None
+        self._last_rendered_frame_index = -1
+        self._infer_candidate_index = 0
         self._last_predictions: list[dict[str, Any]] = []
+        self._last_graph_streams: dict[str, Any] = {}
+        self._last_debug: dict[str, Any] | None = None
         self._last_infer_ms = 0.0
         self._last_infer_total_ms = 0.0
+        self._last_det_pre_ms = 0.0
+        self._last_det_npu_ms = 0.0
+        self._last_det_post_ms = 0.0
+        self._last_roi_ms = 0.0
+        self._last_crop_ms = 0.0
+        self._last_landmark_npu_ms = 0.0
+        self._last_landmark_post_ms = 0.0
+        self._last_palm_detector_skipped = False
+        self._last_prediction_at: float | None = None
+        self._last_prediction_frame_index = -1
         self._last_capture_ms = 0.0
         self._last_nv12_ms = 0.0
         self._last_pipeline_ms = 0.0
@@ -709,29 +1031,51 @@ class HandOmVideoTrack(MediaStreamTrack):
         self._capture_error = ""
         self._infer_error = ""
         self._render_error = ""
+        self._dropped_pipeline_frames = 0
         self._open()
+
+    def _normalize_nv12_for_frame(self, nv12: np.ndarray) -> np.ndarray:
+        if nv12.ndim != 2:
+            raise ValueError(f"NV12 frame must be 2D, got shape={nv12.shape}")
+        rows = self.height + self.height // 2
+        if nv12.shape[0] < rows or nv12.shape[1] < self.width:
+            raise ValueError(f"NV12 frame shape {nv12.shape} is too small for {self.width}x{self.height}")
+        return np.ascontiguousarray(nv12[:rows, : self.width])
 
     def _open(self) -> None:
         if not self.detector_path.exists():
             raise FileNotFoundError(f"Detector OM model not found: {self.detector_path}")
         if not self.landmark_path.exists():
             raise FileNotFoundError(f"Landmark OM model not found: {self.landmark_path}")
-        self.pipeline = HandOmPipeline(
-            self.detector_path,
-            self.landmark_path,
-            device_id=self.device_id,
-            score_threshold=self.score_threshold,
-            nms_iou=self.nms_iou,
-            max_hands=self.max_hands,
-            min_hand_score=self.min_hand_score,
-            reload_detector_each_call=self.reload_detector_each_call,
-        )
-        if self.camera_backend == CAMERA_BACKEND_DVPP:
-            self._open_dvpp_camera()
-        else:
-            self._open_opencv_camera()
+        try:
+            self.pipeline = OmHandPipeline(
+                self.detector_path,
+                self.landmark_path,
+                device_id=self.device_id,
+                score_threshold=self.score_threshold,
+                nms_iou=self.nms_iou,
+                max_hands=self.max_hands,
+                min_hand_score=self.min_hand_score,
+                max_det=20,
+                mode=self.pipeline_mode,
+                reload_detector_each_frame=self.reload_detector_each_call,
+                finalize_on_release=False,
+            )
+            self.realtime_graph = MediaPipeHandRealtimeGraph(self.pipeline)
+            if self.camera_backend == CAMERA_BACKEND_DVPP:
+                self._open_dvpp_camera()
+            else:
+                self._open_opencv_camera()
+            if self.threading_mode == THREADING_MODE_PIPELINE:
+                self._start_pipeline_threads()
+        except Exception:
+            try:
+                self._cleanup()
+            except Exception:
+                app_logger.exception("Failed to roll back partially opened WebRTC hand track")
+            raise
         app_logger.info(
-            "Opened WebRTC hand track detector=%s landmark=%s source=%s capture=%sx%s@%s backend=%s fourcc=%s",
+            "Opened WebRTC hand track detector=%s landmark=%s source=%s capture=%sx%s@%s backend=%s fourcc=%s pipeline=%s threading=%s queue=%s",
             self.detector_path.name,
             self.landmark_path.name,
             self.source,
@@ -740,6 +1084,9 @@ class HandOmVideoTrack(MediaStreamTrack):
             self.fps,
             self.camera_backend,
             self._actual_fourcc or self.camera_fourcc,
+            self.pipeline_mode,
+            self.threading_mode,
+            self.pipeline_queue_size,
         )
         self._publish_stats()
 
@@ -761,15 +1108,13 @@ class HandOmVideoTrack(MediaStreamTrack):
         self._actual_fourcc = decode_fourcc(self.cap.get(cv2.CAP_PROP_FOURCC))
 
     def _open_dvpp_camera(self) -> None:
-        if DvppJpegDecoder is None:
-            raise RuntimeError("DVPP JPEGD modules are unavailable.")
+        load_dvpp_camera_modules()
         device_path = source_to_device_path(self.source)
         if V4l2RawCapture is not None:
             self.capture_impl = V4l2RawCapture(device=device_path, width=self.requested_width, height=self.requested_height, fps=self.requested_fps)
-        elif V4l2MjpegCapture is not None:
-            self.capture_impl = V4l2MjpegCapture(device=device_path, width=self.requested_width, height=self.requested_height, fps=self.requested_fps)
         else:
-            raise RuntimeError("V4L2 MJPEG capture modules are unavailable.")
+            detail = f": {_dvpp_import_error}" if _dvpp_import_error else ""
+            raise RuntimeError(f"V4L2 raw capture module is unavailable{detail}.")
         self.capture_impl.start()
         self.jpegd = DvppJpegDecoder()
         self.width = int(self.capture_impl.width)
@@ -785,6 +1130,9 @@ class HandOmVideoTrack(MediaStreamTrack):
             "landmark": self.landmark_path.name,
             "source": self.source,
             "model_input": "palm 192x192 + landmark 224x224",
+            "pipeline_mode": self.pipeline_mode,
+            "threading_mode": self.threading_mode,
+            "pipeline_queue_size": self.pipeline_queue_size,
             "encoder": encoder_state["name"],
             "encoder_mode": encoder_state["mode"],
             "applied": {
@@ -797,6 +1145,9 @@ class HandOmVideoTrack(MediaStreamTrack):
                 "camera_fourcc": self.camera_fourcc,
                 "actual_fourcc": self._actual_fourcc,
                 "infer_every_n": self.infer_every_n,
+                "pipeline_mode": self.pipeline_mode,
+                "threading_mode": self.threading_mode,
+                "pipeline_queue_size": self.pipeline_queue_size,
                 "score_threshold": self.score_threshold,
                 "nms_iou": self.nms_iou,
                 "max_hands": self.max_hands,
@@ -804,6 +1155,16 @@ class HandOmVideoTrack(MediaStreamTrack):
         }
 
     def _publish_stats(self) -> None:
+        now = time.perf_counter()
+        latest_frame_age_ms = 0.0
+        latest_frame_index = -1
+        with self._frame_condition:
+            if self._latest_frame_packet is not None:
+                latest_frame_index = self._latest_frame_packet.frame_index
+                latest_frame_age_ms = max(0.0, (now - self._latest_frame_packet.captured_at) * 1000.0)
+        prediction_age_ms = 0.0
+        if self._last_prediction_at is not None:
+            prediction_age_ms = max(0.0, (now - self._last_prediction_at) * 1000.0)
         with latest_stats_lock:
             latest_track_stats.clear()
             latest_track_stats.update(
@@ -822,9 +1183,28 @@ class HandOmVideoTrack(MediaStreamTrack):
                     "encoder_mode": encoder_state["mode"],
                     "hardware_encode": encoder_state["hardware_active"],
                     "infer_every_n": self.infer_every_n,
+                    "pipeline_mode": self.pipeline_mode,
+                    "threading_mode": self.threading_mode,
+                    "pipeline_queue_size": self.pipeline_queue_size,
+                    "dropped_frames": self._dropped_pipeline_frames,
+                    "dropped_capture_frames": 0,
+                    "dropped_pipeline_frames": self._dropped_pipeline_frames,
+                    "latest_frame_age_ms": latest_frame_age_ms,
+                    "prediction_age_ms": prediction_age_ms,
+                    "latest_frame_index": latest_frame_index,
+                    "prediction_frame_index": self._last_prediction_frame_index,
+                    "rendered_frame_index": self._last_rendered_frame_index,
                     "hands": len(self._last_predictions),
                     "npu_latency_ms": self._last_infer_ms,
                     "infer_total_ms": self._last_infer_total_ms,
+                    "det_pre_ms": self._last_det_pre_ms,
+                    "det_npu_ms": self._last_det_npu_ms,
+                    "det_post_ms": self._last_det_post_ms,
+                    "roi_ms": self._last_roi_ms,
+                    "crop_ms": self._last_crop_ms,
+                    "landmark_npu_ms": self._last_landmark_npu_ms,
+                    "landmark_post_ms": self._last_landmark_post_ms,
+                    "palm_detector_skipped": self._last_palm_detector_skipped,
                     "capture_ms": self._last_capture_ms,
                     "nv12_ms": self._last_nv12_ms,
                     "pipeline_ms": self._last_pipeline_ms,
@@ -838,6 +1218,19 @@ class HandOmVideoTrack(MediaStreamTrack):
             )
 
     def _read_bgr_frame(self) -> np.ndarray:
+        frame, _nv12 = self._read_capture_frame()
+        if frame is None:
+            raise RuntimeError("BGR frame is unavailable for the selected camera backend")
+        return frame
+
+    def _frame_bgr_for_fallback(self, frame: np.ndarray | None, frame_nv12: np.ndarray | None) -> np.ndarray | None:
+        if frame is not None:
+            return frame
+        if frame_nv12 is not None and self.pipeline_mode != "tracking":
+            return nv12_to_bgr(frame_nv12, self.width, self.height)
+        return None
+
+    def _read_capture_frame(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         capture_start = time.perf_counter()
         try:
             if self.camera_backend == CAMERA_BACKEND_DVPP:
@@ -846,17 +1239,19 @@ class HandOmVideoTrack(MediaStreamTrack):
                 jpeg_bytes = self.capture_impl.read(timeout=2.0)
                 nv12_flat = self.jpegd.decode(jpeg_bytes)
                 nv12 = nv12_flat.reshape(self.jpegd.nv12_shape)
-                frame = nv12_to_bgr(nv12, self.width, self.height)
+                tight_nv12 = self._normalize_nv12_for_frame(nv12)
+                frame = None
             else:
                 if self.cap is None:
                     raise RuntimeError("OpenCV camera is not open")
                 ok, frame = self.cap.read()
                 if not ok or frame is None:
                     raise RuntimeError("Camera read returned no frame")
-            if frame.shape[0] % 2 or frame.shape[1] % 2:
+                tight_nv12 = None
+            if frame is not None and (frame.shape[0] % 2 or frame.shape[1] % 2):
                 frame = frame[: frame.shape[0] - (frame.shape[0] % 2), : frame.shape[1] - (frame.shape[1] % 2)]
             self._capture_error = ""
-            return frame
+            return frame, tight_nv12
         except queue.Empty as exc:
             self._capture_error = "camera read timeout"
             raise RuntimeError(self._capture_error) from exc
@@ -870,48 +1265,138 @@ class HandOmVideoTrack(MediaStreamTrack):
                 self._capture_fps_frames = 0
                 self._capture_fps_start = now
 
-    def _read_output_frame(self):
-        frame_start = time.perf_counter()
-        frame = self._read_bgr_frame()
-        predictions = self._last_predictions
-        if self._frame_index % self.infer_every_n == 0:
+    def _start_pipeline_threads(self) -> None:
+        self._infer_queue = queue.Queue(maxsize=self.pipeline_queue_size)
+        self._inference_thread = threading.Thread(
+            target=self._inference_loop,
+            name="webrtc-hand-infer",
+            daemon=True,
+        )
+        self._inference_thread.start()
+
+    def _join_pipeline_threads(self) -> bool:
+        thread = self._inference_thread
+        if thread is None:
+            return True
+        if thread is threading.current_thread():
+            return False
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        if thread.is_alive():
+            app_logger.warning("Inference thread did not stop within 2 seconds; deferring pipeline release")
+            return False
+        self._inference_thread = None
+        return True
+
+    def _release_pipeline(self) -> None:
+        with self._state_lock:
+            pipeline = self.pipeline
+            self.pipeline = None
+            self.realtime_graph = None
+        if pipeline is not None:
             try:
-                if self.pipeline is None:
-                    raise RuntimeError("Hand OM pipeline is not open")
-                predictions, timing = self.pipeline.infer(frame)
-                self._last_predictions = predictions
-                self._last_infer_ms = float(timing["detector_ms"] + timing["landmark_ms"])
-                self._last_infer_total_ms = float(timing["total_ms"])
-                self._infer_error = ""
-                now = time.perf_counter()
-                self._infer_fps_frames += 1
-                elapsed = now - self._infer_fps_start
-                if elapsed >= 1.0:
-                    self._infer_fps = self._infer_fps_frames / elapsed
-                    self._infer_fps_frames = 0
-                    self._infer_fps_start = now
+                pipeline.close()
+            except Exception:
+                app_logger.exception("Failed to release OM hand pipeline")
+
+    def _put_latest_infer_packet(self, packet: RealtimeFramePacket) -> None:
+        if self._infer_queue is None:
+            return
+        dropped = 0
+        while not self._pipeline_stop.is_set():
+            try:
+                self._infer_queue.put_nowait(packet)
+                break
+            except queue.Full:
+                try:
+                    self._infer_queue.get_nowait()
+                    dropped += 1
+                except queue.Empty:
+                    continue
+        if dropped:
+            self._dropped_pipeline_frames += dropped
+
+    def _inference_loop(self) -> None:
+        try:
+            self._run_inference_loop()
+        finally:
+            with self._state_lock:
+                if self._inference_thread is threading.current_thread():
+                    self._inference_thread = None
+                self._infer_queue = None
+                release_pipeline = self._closed
+            if release_pipeline:
+                self._release_pipeline()
+
+    def _run_inference_loop(self) -> None:
+        while not self._pipeline_stop.is_set():
+            infer_queue = self._infer_queue
+            if infer_queue is None:
+                return
+            try:
+                packet = infer_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            drained = 0
+            while True:
+                try:
+                    packet = infer_queue.get_nowait()
+                    drained += 1
+                except queue.Empty:
+                    break
+            if drained:
+                self._dropped_pipeline_frames += drained
+
+            candidate_index = self._infer_candidate_index
+            self._infer_candidate_index += 1
+            if candidate_index % self.infer_every_n != 0:
+                continue
+            try:
+                if self.realtime_graph is None:
+                    raise RuntimeError("Realtime hand graph is not open")
+                result = self.realtime_graph.process(packet)
+                self._apply_graph_result(result)
             except Exception as exc:
                 self._infer_error = str(exc)
-                app_logger.exception("Hand OM inference failed")
-        try:
-            rendered = draw_hand_predictions(frame, predictions)
-            rendered = draw_status_overlay(
-                rendered,
-                capture_fps=self._capture_fps,
-                infer_fps=self._infer_fps,
-                infer_ms=self._last_infer_total_ms,
-                hands=len(predictions),
-                backend=f"{self.camera_backend}/{self._actual_fourcc or self.camera_fourcc}",
-            )
-            nv12_start = time.perf_counter()
-            nv12 = bgr_to_nv12(rendered)
-            self._last_nv12_ms = (time.perf_counter() - nv12_start) * 1000.0
-            self._render_error = ""
-        except Exception as exc:
-            self._render_error = str(exc)
-            raise
+                app_logger.exception("Hand OM realtime inference failed")
 
-        self._frame_index += 1
+    def _apply_graph_result(self, result: Any) -> None:
+        timing = result.timings
+        det_npu_ms = float(timing.get("det_npu_ms", timing.get("detector_ms", 0.0)) or 0.0)
+        landmark_npu_ms = float(timing.get("landmark_npu_ms", timing.get("landmark_ms", 0.0)) or 0.0)
+        with self._prediction_lock:
+            self._last_predictions = result.predictions
+            self._last_debug = result.debug
+            self._last_graph_streams = result.streams
+            self._last_det_pre_ms = float(timing.get("det_pre_ms", timing.get("preprocess_ms", 0.0)) or 0.0)
+            self._last_det_npu_ms = det_npu_ms
+            self._last_det_post_ms = float(timing.get("det_post_ms", timing.get("decode_ms", 0.0)) or 0.0)
+            self._last_roi_ms = float(timing.get("roi_only_ms", timing.get("roi_ms", 0.0)) or 0.0)
+            self._last_crop_ms = float(timing.get("crop_ms", 0.0) or 0.0)
+            self._last_landmark_npu_ms = landmark_npu_ms
+            self._last_landmark_post_ms = float(timing.get("landmark_post_ms", timing.get("post_ms", 0.0)) or 0.0)
+            self._last_palm_detector_skipped = bool(timing.get("palm_detector_skipped", False))
+            self._last_infer_ms = det_npu_ms + landmark_npu_ms
+            self._last_infer_total_ms = float(timing.get("total_ms", 0.0) or 0.0)
+            self._last_prediction_at = float(result.completed_at)
+            self._last_prediction_frame_index = int(result.frame_index)
+            self._infer_error = ""
+        self._update_infer_fps()
+
+    def _snapshot_predictions(self) -> list[dict[str, Any]]:
+        with self._prediction_lock:
+            return list(self._last_predictions)
+
+    def _update_infer_fps(self) -> None:
+        now = time.perf_counter()
+        self._infer_fps_frames += 1
+        elapsed = now - self._infer_fps_start
+        if elapsed >= 1.0:
+            self._infer_fps = self._infer_fps_frames / elapsed
+            self._infer_fps_frames = 0
+            self._infer_fps_start = now
+
+    def _update_track_fps(self) -> None:
         now = time.perf_counter()
         self._track_fps_frames += 1
         elapsed = now - self._track_fps_start
@@ -919,6 +1404,106 @@ class HandOmVideoTrack(MediaStreamTrack):
             self._track_fps = self._track_fps_frames / elapsed
             self._track_fps_frames = 0
             self._track_fps_start = now
+
+    def _render_frame_to_nv12(
+        self,
+        frame: np.ndarray | None,
+        frame_nv12: np.ndarray | None,
+        predictions: list[dict[str, Any]],
+    ) -> np.ndarray:
+        try:
+            nv12_start = time.perf_counter()
+            if frame_nv12 is not None:
+                nv12 = flip_nv12_horizontal(frame_nv12, self.width, self.height)
+                rendered_predictions = mirror_predictions_horizontal(predictions, self.width)
+                draw_nv12_hand_predictions(nv12, self.width, self.height, rendered_predictions)
+                draw_nv12_status_overlay(
+                    nv12,
+                    self.width,
+                    self.height,
+                    capture_fps=self._capture_fps,
+                    infer_fps=self._infer_fps,
+                    infer_ms=self._last_infer_total_ms,
+                    hands=len(predictions),
+                    backend=f"{self.camera_backend}/{self._actual_fourcc or self.camera_fourcc}",
+                )
+            else:
+                if frame is None:
+                    raise RuntimeError("Cannot render without BGR or NV12 frame")
+                rendered_frame = cv2.flip(frame, 1)
+                rendered_predictions = mirror_predictions_horizontal(predictions, frame.shape[1])
+                rendered = draw_hand_predictions(rendered_frame, rendered_predictions, copy_image=False)
+                rendered = draw_status_overlay(
+                    rendered,
+                    capture_fps=self._capture_fps,
+                    infer_fps=self._infer_fps,
+                    infer_ms=self._last_infer_total_ms,
+                    hands=len(predictions),
+                    backend=f"{self.camera_backend}/{self._actual_fourcc or self.camera_fourcc}",
+                )
+                nv12 = bgr_to_nv12(rendered)
+            self._last_nv12_ms = (time.perf_counter() - nv12_start) * 1000.0
+            self._render_error = ""
+            return nv12
+        except Exception as exc:
+            self._render_error = str(exc)
+            raise
+
+    def _read_output_frame(self):
+        frame_start = time.perf_counter()
+        frame, frame_nv12 = self._read_capture_frame()
+        predictions = self._snapshot_predictions()
+        if self._frame_index % self.infer_every_n == 0:
+            try:
+                if self.realtime_graph is None:
+                    raise RuntimeError("Realtime hand graph is not open")
+                now = time.perf_counter()
+                packet = RealtimeFramePacket(
+                    frame_index=self._frame_index,
+                    timestamp=now,
+                    captured_at=now,
+                    image_bgr=self._frame_bgr_for_fallback(frame, frame_nv12),
+                    image_nv12=frame_nv12,
+                    image_width=self.width,
+                    image_height=self.height,
+                )
+                result = self.realtime_graph.process(packet)
+                predictions = result.predictions
+                self._apply_graph_result(result)
+            except Exception as exc:
+                self._infer_error = str(exc)
+                app_logger.exception("Hand OM inference failed")
+        nv12 = self._render_frame_to_nv12(frame, frame_nv12, predictions)
+
+        self._frame_index += 1
+        self._last_rendered_frame_index = self._frame_index - 1
+        self._update_track_fps()
+        self._last_pipeline_ms = (time.perf_counter() - frame_start) * 1000.0
+        self._publish_stats()
+        return nv12
+
+    def _read_pipeline_output_frame(self):
+        frame_start = time.perf_counter()
+        frame, frame_nv12 = self._read_capture_frame()
+        now = time.perf_counter()
+        packet = RealtimeFramePacket(
+            frame_index=self._frame_index,
+            timestamp=now,
+            captured_at=now,
+            image_bgr=self._frame_bgr_for_fallback(frame, frame_nv12),
+            image_nv12=frame_nv12,
+            image_width=self.width,
+            image_height=self.height,
+        )
+        with self._frame_condition:
+            self._latest_frame_packet = packet
+        self._put_latest_infer_packet(packet)
+
+        predictions = self._snapshot_predictions()
+        nv12 = self._render_frame_to_nv12(frame, frame_nv12, predictions)
+        self._frame_index += 1
+        self._last_rendered_frame_index = packet.frame_index
+        self._update_track_fps()
         self._last_pipeline_ms = (time.perf_counter() - frame_start) * 1000.0
         self._publish_stats()
         return nv12
@@ -940,7 +1525,10 @@ class HandOmVideoTrack(MediaStreamTrack):
         pts, time_base = await self.next_timestamp()
         loop = asyncio.get_running_loop()
         try:
-            frame = await loop.run_in_executor(None, self._read_output_frame)
+            if self.threading_mode == THREADING_MODE_PIPELINE:
+                frame = await loop.run_in_executor(None, self._read_pipeline_output_frame)
+            else:
+                frame = await loop.run_in_executor(None, self._read_output_frame)
         except RuntimeError as exc:
             raise MediaStreamError(str(exc)) from exc
         video_frame = av.VideoFrame.from_ndarray(frame, format="nv12")
@@ -953,19 +1541,31 @@ class HandOmVideoTrack(MediaStreamTrack):
             if self._closed:
                 return
             self._closed = True
+            self._pipeline_stop.set()
+            with self._frame_condition:
+                self._frame_condition.notify_all()
             self._publish_stats()
+        inference_stopped = self._join_pipeline_threads()
         if self.cap is not None:
-            self.cap.release()
+            try:
+                self.cap.release()
+            except Exception:
+                app_logger.exception("Failed to release OpenCV camera")
             self.cap = None
         if self.capture_impl is not None:
-            self.capture_impl.stop()
+            try:
+                self.capture_impl.stop()
+            except Exception:
+                app_logger.exception("Failed to stop V4L2 capture")
             self.capture_impl = None
         if self.jpegd is not None:
-            self.jpegd.destroy()
+            try:
+                self.jpegd.destroy()
+            except Exception:
+                app_logger.exception("Failed to destroy JPEG decoder")
             self.jpegd = None
-        if self.pipeline is not None:
-            self.pipeline.close()
-            self.pipeline = None
+        if inference_stopped:
+            self._release_pipeline()
 
     def stop(self) -> None:
         app_logger.info("Stopping WebRTC hand track detector=%s landmark=%s", self.detector_path.name, self.landmark_path.name)
@@ -977,7 +1577,13 @@ class HandOmVideoTrack(MediaStreamTrack):
 
 
 async def offer(request: web.Request) -> web.Response:
-    params = parse_offer_payload(await request.json(), default_device_id=int(request.config_dict.get("device_id", 0)))
+    params = parse_offer_payload(
+        await request.json(),
+        default_device_id=int(request.config_dict.get("device_id", 0)),
+        default_pipeline_mode=str(request.config_dict.get("pipeline_mode", "tracking")),
+        default_threading_mode=str(request.config_dict.get("threading_mode", DEFAULT_THREADING_MODE)),
+        default_pipeline_queue_size=int(request.config_dict.get("pipeline_queue_size", DEFAULT_PIPELINE_QUEUE_SIZE)),
+    )
     offer_sdp: RTCSessionDescription = params["offer"]  # type: ignore[assignment]
     if not _offer_has_h264(offer_sdp.sdp):
         raise web.HTTPBadRequest(text="Browser offer does not contain video/H264.")
@@ -1023,7 +1629,8 @@ async def offer(request: web.Request) -> web.Response:
         pcs.clear()
         await asyncio.sleep(0.3)
 
-    pc = RTCPeerConnection()
+    ice_servers = request.config_dict.get("ice_servers", [])
+    pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
     pcs.add(pc)
     track: HandOmVideoTrack | None = None
     connect_timeout_task: asyncio.Task | None = None
@@ -1045,6 +1652,9 @@ async def offer(request: web.Request) -> web.Response:
             camera_backend=str(params["camera_backend"]),
             camera_fourcc=str(params["camera_fourcc"]),
             reload_detector_each_call=bool(request.config_dict.get("reload_detector_each_call", False)),
+            pipeline_mode=str(params["pipeline_mode"]),
+            threading_mode=str(params["threading_mode"]),
+            pipeline_queue_size=int(params["pipeline_queue_size"]),
         )
         pc_tracks[pc] = track
         sender = pc.addTrack(track)
@@ -1154,9 +1764,13 @@ def build_app(args: argparse.Namespace) -> web.Application:
     app["nms_iou"] = args.nms_iou
     app["max_hands"] = args.max_hands
     app["min_hand_score"] = args.min_hand_score
+    app["pipeline_mode"] = args.pipeline_mode
+    app["threading_mode"] = args.threading_mode
+    app["pipeline_queue_size"] = args.pipeline_queue_size
     app["bitrate_kbps"] = args.bitrate_kbps
     app["encoder_mode"] = args.encoder_mode
     app["cann_venc_retry_seconds"] = args.cann_venc_retry_seconds
+    app["ice_servers"] = parse_ice_servers(args.ice_servers)
     app["camera_backend"] = args.camera_backend
     app["camera_fourcc"] = args.camera_fourcc
     app["reload_detector_each_call"] = args.reload_detector_each_call
@@ -1265,11 +1879,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nms-iou", default=0.3, type=float)
     parser.add_argument("--max-hands", default=2, type=int)
     parser.add_argument("--min-hand-score", default=0.5, type=float)
+    parser.add_argument("--pipeline-mode", default="tracking", choices=["tracking", "image"])
+    parser.add_argument("--threading-mode", default=DEFAULT_THREADING_MODE, choices=[THREADING_MODE_PIPELINE, THREADING_MODE_SERIAL])
+    parser.add_argument("--pipeline-queue-size", default=DEFAULT_PIPELINE_QUEUE_SIZE, type=int, choices=PIPELINE_QUEUE_SIZES)
     parser.add_argument("--bitrate-kbps", default=DEFAULT_H264_BITRATE_KBPS, type=int)
-    parser.add_argument("--camera-backend", default=CAMERA_BACKEND_OPENCV, choices=[CAMERA_BACKEND_OPENCV, CAMERA_BACKEND_DVPP])
+    parser.add_argument("--camera-backend", default=DEFAULT_CAMERA_BACKEND, choices=[CAMERA_BACKEND_OPENCV, CAMERA_BACKEND_DVPP])
     parser.add_argument("--camera-fourcc", default="MJPG", choices=["MJPG", "YUYV", "DEFAULT"])
     parser.add_argument("--reload-detector-each-call", action="store_true")
-    parser.add_argument("--encoder-mode", default="cpu", choices=["cpu", "cann"])
+    parser.add_argument("--encoder-mode", default=DEFAULT_ENCODER_MODE, choices=["cpu", "cann"])
+    parser.add_argument(
+        "--ice-servers",
+        default=os.environ.get("WEBRTC_ICE_SERVERS", DEFAULT_ICE_SERVERS),
+        help="Comma-separated ICE server URLs. Empty default uses LAN-only host candidates and avoids public STUN on the board.",
+    )
     parser.add_argument(
         "--cann-venc-retry-seconds",
         default=int(os.environ.get("CANN_VENC_RETRY_SECONDS", str(DEFAULT_CANN_VENC_RETRY_SECONDS))),
@@ -1283,6 +1905,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    faulthandler.enable(all_threads=True)
     args = parse_args()
     cv2.setNumThreads(max(1, args.opencv_threads))
     setup_logging(args.log_level, args.log_file)
