@@ -5,6 +5,12 @@ const elements = {
   pipelineMode: document.querySelector("#pipelineMode"),
   threadingMode: document.querySelector("#threadingMode"),
   pipelineQueueSize: document.querySelector("#pipelineQueueSize"),
+  sourceModeCamera: document.querySelector("#sourceModeCamera"),
+  sourceModeVideo: document.querySelector("#sourceModeVideo"),
+  cameraSourceField: document.querySelector("#cameraSourceField"),
+  videoSourceField: document.querySelector("#videoSourceField"),
+  videoSource: document.querySelector("#videoSource"),
+  videoSourceMeta: document.querySelector("#videoSourceMeta"),
   source: document.querySelector("#source"),
   resolution: document.querySelector("#resolution"),
   fps: document.querySelector("#fps"),
@@ -48,6 +54,12 @@ let lastServerErrorText = "";
 let startInProgress = false;
 let fpsTrackingId = null;
 let fpsTimestamps = [];
+let controlsBusy = false;
+let sourceMode = "camera";
+let datasetVideos = [];
+let cameraSourceValue = "/dev/video0";
+let cameraBackendValue = "dvpp";
+let cameraFourccValue = "MJPG";
 
 function log(message) {
   const timestamp = new Date().toLocaleTimeString("zh-CN", { hour12: false });
@@ -124,6 +136,92 @@ function fillSelect(select, items, fallbackName) {
   }
 }
 
+function formatBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024 * 1024) {
+    return `${Math.max(1, Math.round(bytes / 1024))} KiB`;
+  }
+  if (bytes < 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  }
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+}
+
+function findDatasetVideo(source) {
+  const normalized = String(source ?? "").replaceAll("\\", "/");
+  return datasetVideos.find((item) => normalized === item.path || normalized.endsWith(`/${item.path}`));
+}
+
+function updateVideoSourceMeta() {
+  const selected = datasetVideos.find((item) => item.path === elements.videoSource.value);
+  if (!selected) {
+    elements.videoSourceMeta.textContent = datasetVideos.length ? `${datasetVideos.length} 个视频` : "未找到视频";
+    return;
+  }
+  elements.videoSourceMeta.textContent = `${datasetVideos.length} 个视频 · ${formatBytes(selected.size_bytes)} · 循环播放`;
+}
+
+function updateSourceControls() {
+  const videoMode = sourceMode === "video";
+  elements.sourceModeCamera.classList.toggle("active", !videoMode);
+  elements.sourceModeVideo.classList.toggle("active", videoMode);
+  elements.sourceModeCamera.setAttribute("aria-pressed", String(!videoMode));
+  elements.sourceModeVideo.setAttribute("aria-pressed", String(videoMode));
+  elements.cameraSourceField.hidden = videoMode;
+  elements.videoSourceField.hidden = !videoMode;
+  elements.videoSourceMeta.hidden = !videoMode;
+  elements.sourceModeCamera.disabled = controlsBusy;
+  elements.sourceModeVideo.disabled = controlsBusy || !datasetVideos.length;
+  elements.source.disabled = controlsBusy || videoMode;
+  elements.videoSource.disabled = controlsBusy || !videoMode || !datasetVideos.length;
+  elements.cameraBackend.disabled = controlsBusy || videoMode;
+  elements.cameraFourcc.disabled = controlsBusy || videoMode;
+}
+
+function setSourceMode(mode, announce = false) {
+  const nextMode = mode === "video" && datasetVideos.length ? "video" : "camera";
+  if (sourceMode === "camera" && nextMode === "video") {
+    cameraSourceValue = elements.source.value.trim() || cameraSourceValue;
+    cameraBackendValue = elements.cameraBackend.value;
+    cameraFourccValue = elements.cameraFourcc.value;
+  }
+  sourceMode = nextMode;
+  if (sourceMode === "video") {
+    elements.cameraBackend.value = "opencv";
+    elements.cameraFourcc.value = "DEFAULT";
+    elements.source.value = elements.videoSource.value;
+    updateVideoSourceMeta();
+  } else {
+    elements.source.value = cameraSourceValue;
+    elements.cameraBackend.value = cameraBackendValue;
+    elements.cameraFourcc.value = cameraFourccValue;
+  }
+  updateSourceControls();
+  if (announce) {
+    log(sourceMode === "video" ? `已选择视频: ${elements.videoSource.options[elements.videoSource.selectedIndex]?.textContent ?? ""}` : "已切换到摄像头输入");
+  }
+}
+
+async function loadVideos() {
+  const data = await fetchJson("/videos");
+  datasetVideos = data.videos ?? [];
+  elements.videoSource.innerHTML = "";
+  for (const item of datasetVideos) {
+    const option = document.createElement("option");
+    option.value = item.path;
+    option.textContent = `${item.name} (${formatBytes(item.size_bytes)})`;
+    elements.videoSource.append(option);
+  }
+  if (!datasetVideos.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "未找到 PianoVAM 视频";
+    elements.videoSource.append(option);
+  }
+  updateVideoSourceMeta();
+  updateSourceControls();
+}
+
 async function loadModels() {
   const data = await fetchJson("/models");
   fillSelect(elements.detector, data.detectors ?? [], "mediapipe_legacy_0_10_14_palm_detection_full_downsample_resize_maxpool_slices_origin_dtype.om");
@@ -188,27 +286,37 @@ async function checkHealth() {
   if (defaults.camera_fourcc) {
     setSelectValue(elements.cameraFourcc, defaults.camera_fourcc);
   }
+  cameraBackendValue = elements.cameraBackend.value;
+  cameraFourccValue = elements.cameraFourcc.value;
+  const defaultVideo = findDatasetVideo(data.default_source);
+  if (defaultVideo) {
+    cameraSourceValue = "/dev/video0";
+    elements.videoSource.value = defaultVideo.path;
+    setSourceMode("video");
+  } else {
+    cameraSourceValue = data.default_source || cameraSourceValue;
+    setSourceMode("camera");
+  }
 }
 
 function setControlsBusy(isBusy) {
+  controlsBusy = isBusy;
   elements.start.disabled = isBusy;
   elements.detector.disabled = isBusy;
   elements.landmark.disabled = isBusy;
   elements.pipelineMode.disabled = isBusy;
   elements.threadingMode.disabled = isBusy;
   elements.pipelineQueueSize.disabled = isBusy;
-  elements.source.disabled = isBusy;
   elements.resolution.disabled = isBusy;
   elements.fps.disabled = isBusy;
   elements.bitrateKbps.disabled = isBusy;
-  elements.cameraBackend.disabled = isBusy;
-  elements.cameraFourcc.disabled = isBusy;
   elements.encoderMode.disabled = isBusy;
   elements.scoreThreshold.disabled = isBusy;
   elements.nmsIou.disabled = isBusy;
   elements.maxHands.disabled = isBusy;
   elements.minHandScore.disabled = isBusy;
   elements.inferEvery.disabled = isBusy;
+  updateSourceControls();
 }
 
 function resetRemoteVideoSize() {
@@ -543,6 +651,12 @@ async function startConnection() {
   const scoreThreshold = numericRange(elements.scoreThreshold.value, "Palm 阈值", 0.01, 0.99);
   const nmsIou = numericRange(elements.nmsIou.value, "NMS IoU", 0.01, 0.99);
   const minHandScore = numericRange(elements.minHandScore.value, "Landmark 阈值", 0, 1);
+  const selectedSource = sourceMode === "video" ? elements.videoSource.value : elements.source.value.trim();
+  if (!selectedSource) {
+    startInProgress = false;
+    setControlsBusy(false);
+    throw new Error("请选择输入来源。");
+  }
 
   let connection = null;
   try {
@@ -567,14 +681,14 @@ async function startConnection() {
         type: connection.localDescription.type,
         detector: elements.detector.value,
         landmark: elements.landmark.value,
-        source: elements.source.value,
+        source: selectedSource,
         width,
         height,
         fps,
         bitrate_kbps: bitrateKbps,
         encoder_mode: elements.encoderMode.value,
-        camera_backend: elements.cameraBackend.value,
-        camera_fourcc: elements.cameraFourcc.value,
+        camera_backend: sourceMode === "video" ? "opencv" : elements.cameraBackend.value,
+        camera_fourcc: sourceMode === "video" ? "DEFAULT" : elements.cameraFourcc.value,
         pipeline_mode: elements.pipelineMode.value,
         threading_mode: elements.threadingMode.value,
         pipeline_queue_size: positiveInteger(elements.pipelineQueueSize.value, "Pipeline queue"),
@@ -628,6 +742,28 @@ async function startConnection() {
 }
 
 function bindEvents() {
+  elements.source.addEventListener("input", () => {
+    if (sourceMode === "camera") {
+      cameraSourceValue = elements.source.value;
+    }
+  });
+  elements.cameraBackend.addEventListener("change", () => {
+    if (sourceMode === "camera") {
+      cameraBackendValue = elements.cameraBackend.value;
+    }
+  });
+  elements.cameraFourcc.addEventListener("change", () => {
+    if (sourceMode === "camera") {
+      cameraFourccValue = elements.cameraFourcc.value;
+    }
+  });
+  elements.sourceModeCamera.addEventListener("click", () => setSourceMode("camera", true));
+  elements.sourceModeVideo.addEventListener("click", () => setSourceMode("video", true));
+  elements.videoSource.addEventListener("change", () => {
+    elements.source.value = elements.videoSource.value;
+    updateVideoSourceMeta();
+    log(`已选择视频: ${elements.videoSource.options[elements.videoSource.selectedIndex]?.textContent ?? ""}`);
+  });
   elements.start.addEventListener("click", () => {
     startConnection().catch((error) => log(`启动失败: ${error.message}`));
   });
@@ -651,7 +787,8 @@ async function init() {
   setText(elements.inferStatus, "-");
   setText(elements.handStatus, "-");
   setText(elements.trackFpsStatus, "-");
-  await Promise.all([loadModels(), checkHealth()]);
+  await Promise.all([loadModels(), loadVideos()]);
+  await checkHealth();
   log("页面就绪。");
 }
 

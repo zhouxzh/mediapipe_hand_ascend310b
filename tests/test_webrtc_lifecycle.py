@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import queue
+from pathlib import Path
 import threading
+import tempfile
 import unittest
 from unittest import mock
 
 import numpy as np
 
+from scripts import webrtc_hand_om_app
 from scripts.webrtc_hand_om_app import HandOmVideoTrack
 from webrtc_app import cann_encoder
 from webrtc_app.v4l2_raw import V4l2RawCapture
@@ -52,6 +55,67 @@ class WebrtcTrackCleanupTests(unittest.TestCase):
         pipeline.close.assert_called_once_with()
         self.assertIsNone(track.pipeline)
         self.assertIsNone(track.realtime_graph)
+
+
+class DatasetVideoSourceTests(unittest.TestCase):
+    def test_video_listing_returns_supported_files_with_relative_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video_dir = root / "data" / "PianoVAM_v1" / "Video"
+            video_dir.mkdir(parents=True)
+            (video_dir / "b.MKV").write_bytes(b"b" * 2048)
+            (video_dir / "a.mp4").write_bytes(b"a" * 1024)
+            (video_dir / "notes.txt").write_text("ignore", encoding="utf-8")
+
+            videos = webrtc_hand_om_app.list_dataset_videos(video_dir=video_dir, root=root)
+
+        self.assertEqual([item["name"] for item in videos], ["a.mp4", "b.MKV"])
+        self.assertEqual(videos[0]["path"], "data/PianoVAM_v1/Video/a.mp4")
+        self.assertEqual(videos[0]["size_bytes"], 1024)
+
+    def test_file_source_rewinds_and_requests_tracker_reset_at_eof(self) -> None:
+        track = HandOmVideoTrack.__new__(HandOmVideoTrack)
+        frame = np.zeros((4, 6, 3), dtype=np.uint8)
+        track.camera_backend = webrtc_hand_om_app.CAMERA_BACKEND_OPENCV
+        track.cap = mock.Mock()
+        track.cap.read.side_effect = [(False, None), (True, frame)]
+        track._source_is_file = True
+        track._source_loop_count = 0
+        track._pipeline_reset_requested = threading.Event()
+        track._prediction_lock = threading.Lock()
+        track._last_predictions = [{"hand": 1}]
+        track._last_graph_streams = {"hand_rects": [1]}
+        track._last_debug = {"debug": True}
+        track._last_prediction_at = 1.0
+        track._last_prediction_frame_index = 10
+        track._capture_error = ""
+        track._last_capture_ms = 0.0
+        track._capture_fps_start = 0.0
+        track._capture_fps_frames = 0
+        track._capture_fps = 0.0
+
+        output, nv12 = track._read_capture_frame()
+
+        self.assertIs(output, frame)
+        self.assertIsNone(nv12)
+        track.cap.set.assert_called_once_with(webrtc_hand_om_app.cv2.CAP_PROP_POS_FRAMES, 0)
+        self.assertEqual(track._source_loop_count, 1)
+        self.assertTrue(track._pipeline_reset_requested.is_set())
+        self.assertEqual(track._last_predictions, [])
+
+    def test_requested_reset_clears_pipeline_and_graph_state(self) -> None:
+        track = HandOmVideoTrack.__new__(HandOmVideoTrack)
+        track._pipeline_reset_requested = threading.Event()
+        track._pipeline_reset_requested.set()
+        track.pipeline = mock.Mock()
+        track.realtime_graph = mock.Mock()
+        track.realtime_graph.STREAM_NAMES = ("palms", "hands")
+
+        reset = track._reset_pipeline_if_requested()
+
+        self.assertTrue(reset)
+        track.pipeline.reset.assert_called_once_with()
+        self.assertEqual(track.realtime_graph.last_streams, {"palms": [], "hands": []})
 
 
 class V4l2CleanupTests(unittest.TestCase):

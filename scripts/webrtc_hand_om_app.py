@@ -200,6 +200,8 @@ def load_dvpp_camera_modules() -> None:
 
 WEB_DIR = ROOT / "web"
 MODELS_DIR = ROOT / "models" / "om"
+PIANOVAM_VIDEO_DIR = ROOT / "data" / "PianoVAM_v1" / "Video"
+VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 LOG_DIR = ROOT / "logs"
 DEFAULT_DETECTOR = "mediapipe_legacy_0_10_14_palm_detection_full_downsample_resize_maxpool_slices_origin_dtype.om"
 DEFAULT_LANDMARK = "mediapipe_legacy_0_10_14_hand_landmark_full.om"
@@ -668,6 +670,32 @@ def list_om_models() -> dict[str, list[dict[str, object]]]:
     return items
 
 
+def list_dataset_videos(
+    video_dir: Path | None = None,
+    root: Path | None = None,
+) -> list[dict[str, object]]:
+    directory = PIANOVAM_VIDEO_DIR if video_dir is None else Path(video_dir)
+    path_root = ROOT if root is None else Path(root)
+    if not directory.is_dir():
+        return []
+    items: list[dict[str, object]] = []
+    for path in sorted(directory.iterdir(), key=lambda item: item.name.lower()):
+        if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
+            continue
+        try:
+            source_path = path.relative_to(path_root).as_posix()
+        except ValueError:
+            source_path = str(path.resolve())
+        items.append(
+            {
+                "name": path.name,
+                "path": source_path,
+                "size_bytes": path.stat().st_size,
+            }
+        )
+    return items
+
+
 def resolve_model_path(model_value: str | os.PathLike[str]) -> Path:
     model_path = Path(str(model_value))
     if model_path.is_absolute():
@@ -741,6 +769,15 @@ async def models(request: web.Request) -> web.Response:
             **items,
             "default_detector": request.config_dict.get("default_detector", default_model_name(None, DEFAULT_DETECTOR, "detector")),
             "default_landmark": request.config_dict.get("default_landmark", default_model_name(None, DEFAULT_LANDMARK, "landmark")),
+        }
+    )
+
+
+async def videos(_: web.Request) -> web.Response:
+    return web.json_response(
+        {
+            "videos": list_dataset_videos(),
+            "directory": PIANOVAM_VIDEO_DIR.relative_to(ROOT).as_posix(),
         }
     )
 
@@ -986,6 +1023,9 @@ class HandOmVideoTrack(MediaStreamTrack):
         self.capture_impl = None
         self.jpegd = None
         self._actual_fourcc = ""
+        self._source_type = "camera"
+        self._source_is_file = False
+        self._source_loop_count = 0
         self._start: float | None = None
         self._timestamp = 0
         self._frame_time = 1 / max(self.fps, 1)
@@ -995,6 +1035,7 @@ class HandOmVideoTrack(MediaStreamTrack):
         self._prediction_lock = threading.Lock()
         self._frame_condition = threading.Condition()
         self._pipeline_stop = threading.Event()
+        self._pipeline_reset_requested = threading.Event()
         self._infer_queue: queue.Queue[RealtimeFramePacket] | None = None
         self._inference_thread: threading.Thread | None = None
         self._latest_frame_packet: RealtimeFramePacket | None = None
@@ -1091,16 +1132,28 @@ class HandOmVideoTrack(MediaStreamTrack):
         self._publish_stats()
 
     def _open_opencv_camera(self) -> None:
-        source: int | str = int(self.source) if str(self.source).isdigit() else self.source
-        self.cap = cv2.VideoCapture(source, cv2.CAP_V4L2 if os.name != "nt" else cv2.CAP_ANY)
+        source_text = str(self.source).strip()
+        candidate = Path(source_text).expanduser()
+        if not candidate.is_absolute():
+            candidate = ROOT / candidate
+        self._source_is_file = candidate.is_file()
+        if self._source_is_file:
+            source: int | str = str(candidate.resolve())
+            self._source_type = "video"
+            self.cap = cv2.VideoCapture(source)
+        else:
+            source = int(source_text) if source_text.isdigit() else source_text
+            self._source_type = "camera"
+            self.cap = cv2.VideoCapture(source, cv2.CAP_V4L2 if os.name != "nt" else cv2.CAP_ANY)
         if not self.cap.isOpened():
             raise RuntimeError(f"Failed to open camera source: {self.source}")
-        if self.camera_fourcc != "DEFAULT":
-            fourcc = cv2.VideoWriter_fourcc(*self.camera_fourcc)
-            self.cap.set(cv2.CAP_PROP_FOURCC, fourcc)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.requested_width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.requested_height)
-        self.cap.set(cv2.CAP_PROP_FPS, self.requested_fps)
+        if not self._source_is_file:
+            if self.camera_fourcc != "DEFAULT":
+                fourcc = cv2.VideoWriter_fourcc(*self.camera_fourcc)
+                self.cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.requested_width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.requested_height)
+            self.cap.set(cv2.CAP_PROP_FPS, self.requested_fps)
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or self.requested_width)
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or self.requested_height)
         self.fps = int(round(self.cap.get(cv2.CAP_PROP_FPS) or self.requested_fps))
@@ -1129,6 +1182,8 @@ class HandOmVideoTrack(MediaStreamTrack):
             "detector": self.detector_path.name,
             "landmark": self.landmark_path.name,
             "source": self.source,
+            "source_type": self._source_type,
+            "loop_video": self._source_is_file,
             "model_input": "palm 192x192 + landmark 224x224",
             "pipeline_mode": self.pipeline_mode,
             "threading_mode": self.threading_mode,
@@ -1173,6 +1228,8 @@ class HandOmVideoTrack(MediaStreamTrack):
                     "detector": self.detector_path.name,
                     "landmark": self.landmark_path.name,
                     "source": self.source,
+                    "source_type": self._source_type,
+                    "source_loop_count": self._source_loop_count,
                     "width": self.width,
                     "height": self.height,
                     "fps": self.fps,
@@ -1230,6 +1287,28 @@ class HandOmVideoTrack(MediaStreamTrack):
             return nv12_to_bgr(frame_nv12, self.width, self.height)
         return None
 
+    def _mark_video_looped(self) -> None:
+        self._source_loop_count += 1
+        self._pipeline_reset_requested.set()
+        with self._prediction_lock:
+            self._last_predictions = []
+            self._last_graph_streams = {}
+            self._last_debug = None
+            self._last_prediction_at = None
+            self._last_prediction_frame_index = -1
+
+    def _reset_pipeline_if_requested(self) -> bool:
+        if not self._pipeline_reset_requested.is_set():
+            return False
+        self._pipeline_reset_requested.clear()
+        if self.pipeline is not None:
+            self.pipeline.reset()
+        if self.realtime_graph is not None:
+            self.realtime_graph.last_streams = {
+                name: [] for name in self.realtime_graph.STREAM_NAMES
+            }
+        return True
+
     def _read_capture_frame(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         capture_start = time.perf_counter()
         try:
@@ -1245,6 +1324,11 @@ class HandOmVideoTrack(MediaStreamTrack):
                 if self.cap is None:
                     raise RuntimeError("OpenCV camera is not open")
                 ok, frame = self.cap.read()
+                if (not ok or frame is None) and self._source_is_file:
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ok, frame = self.cap.read()
+                    if ok and frame is not None:
+                        self._mark_video_looped()
                 if not ok or frame is None:
                     raise RuntimeError("Camera read returned no frame")
                 tight_nv12 = None
@@ -1347,9 +1431,10 @@ class HandOmVideoTrack(MediaStreamTrack):
             if drained:
                 self._dropped_pipeline_frames += drained
 
+            reset_for_loop = self._reset_pipeline_if_requested()
             candidate_index = self._infer_candidate_index
             self._infer_candidate_index += 1
-            if candidate_index % self.infer_every_n != 0:
+            if not reset_for_loop and candidate_index % self.infer_every_n != 0:
                 continue
             try:
                 if self.realtime_graph is None:
@@ -1452,8 +1537,9 @@ class HandOmVideoTrack(MediaStreamTrack):
     def _read_output_frame(self):
         frame_start = time.perf_counter()
         frame, frame_nv12 = self._read_capture_frame()
+        reset_for_loop = self._reset_pipeline_if_requested()
         predictions = self._snapshot_predictions()
-        if self._frame_index % self.infer_every_n == 0:
+        if reset_for_loop or self._frame_index % self.infer_every_n == 0:
             try:
                 if self.realtime_graph is None:
                     raise RuntimeError("Realtime hand graph is not open")
@@ -1780,6 +1866,7 @@ def build_app(args: argparse.Namespace) -> web.Application:
     app.router.add_get("/styles.css", styles_css)
     app.router.add_get("/health", health)
     app.router.add_get("/models", models)
+    app.router.add_get("/videos", videos)
     app.router.add_get("/stats", stats)
     app.router.add_post("/offer", offer)
     return app

@@ -15,6 +15,10 @@
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
@@ -89,6 +93,7 @@ dd {
 
 .controls,
 .viewer {
+  min-width: 0;
   border: 1px solid var(--edge);
   border-radius: 8px;
   background: var(--panel);
@@ -111,6 +116,64 @@ dd {
   font-size: 0.82rem;
 }
 
+.source-picker {
+  display: grid;
+  gap: 10px;
+  padding: 12px 0;
+  border-top: 1px solid var(--edge);
+  border-bottom: 1px solid var(--edge);
+}
+
+.source-picker-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.source-picker-header > span {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.segmented {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  width: 190px;
+  border: 1px solid #b9c6cf;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+button.segment {
+  border: 0;
+  border-radius: 0;
+  padding: 7px 9px;
+  background: #f8fafb;
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+button.segment + button.segment {
+  border-left: 1px solid #b9c6cf;
+}
+
+button.segment:hover {
+  background: #edf2f5;
+}
+
+button.segment.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.source-meta {
+  color: var(--muted);
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
 select,
 input,
 button {
@@ -123,6 +186,7 @@ button {
 
 select,
 input {
+  min-width: 0;
   background: #fff;
   color: var(--text);
 }
@@ -276,6 +340,15 @@ video {
   .three-col,
   .actions {
     grid-template-columns: 1fr;
+  }
+
+  .source-picker-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .segmented {
+    width: 100%;
   }
 
   video,

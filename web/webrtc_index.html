@@ -61,10 +61,25 @@
               <option value="image">Frame detector</option>
             </select>
           </label>
-          <label class="field">
-            <span>摄像头</span>
+        </div>
+
+        <div class="source-picker">
+          <div class="source-picker-header">
+            <span>输入来源</span>
+            <div class="segmented" role="group" aria-label="输入来源">
+              <button id="sourceModeCamera" type="button" class="segment active" aria-pressed="true">摄像头</button>
+              <button id="sourceModeVideo" type="button" class="segment" aria-pressed="false">数据集视频</button>
+            </div>
+          </div>
+          <label id="cameraSourceField" class="field">
+            <span>摄像头设备</span>
             <input id="source" type="text" value="/dev/video0">
           </label>
+          <label id="videoSourceField" class="field" hidden>
+            <span>PianoVAM 视频</span>
+            <select id="videoSource"></select>
+          </label>
+          <div id="videoSourceMeta" class="source-meta" hidden></div>
         </div>
 
         <div class="two-col">
